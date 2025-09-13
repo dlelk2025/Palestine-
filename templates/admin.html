@@ -85,7 +85,7 @@
                     <div class="mb-3">
                         <label for="site_name" class="form-label">اسم الموقع</label>
                         <input type="text" class="form-control" id="site_name" name="site_name" 
-                               value="{{ settings[1] if settings else 'نظام إدارة البيانات' }}">
+                               value="{{ settings[1] if settings else 'هيئة فلسطين التنموية' }}">
                     </div>
                     
                     <div class="mb-3">
@@ -166,7 +166,7 @@
                                         {{ 'مدير' if user[2] else 'مستخدم' }}
                                     </span>
                                 </td>
-                                <td>{{ user[3][:10] }}</td>
+                                <td>{{ user[3]|local_dt if user[3] else '-' }}</td>
                                 <td>
                                     <a href="{{ url_for('edit_user', user_id=user[0]) }}" class="btn btn-warning btn-sm">
                                         <i class="fas fa-edit"></i> تعديل

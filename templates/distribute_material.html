@@ -1,0 +1,212 @@
+{% extends "base.html" %}
+
+{% block title %}توزيع المواد{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5><i class="fas fa-hand-holding"></i> توزيع المواد للمواطنين</h5>
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="citizen_search" class="form-label">البحث عن المواطن <span class="text-danger">*</span></label>
+                            <div class="position-relative">
+                                <input type="text" class="form-control" id="citizen_search" 
+                                       placeholder="ابحث بالاسم أو الرقم الوطني..." autocomplete="off">
+                                <i class="fas fa-search position-absolute" style="top: 50%; left: 10px; transform: translateY(-50%); color: #6c757d;"></i>
+                            </div>
+                            
+                            <!-- نتائج البحث -->
+                            <div id="search_results" class="list-group mt-2" style="display: none; max-height: 200px; overflow-y: auto;">
+                            </div>
+                            
+                            <!-- الحقل المخفي للمواطن المختار -->
+                            <input type="hidden" id="citizen_id" name="citizen_id" required>
+                            
+                            <!-- عرض المواطن المختار -->
+                            <div id="selected_citizen" class="alert alert-success mt-2" style="display: none;">
+                                <i class="fas fa-user"></i> تم اختيار: <span id="selected_citizen_name"></span>
+                                <button type="button" class="btn btn-sm btn-outline-danger float-end" onclick="clearSelectedCitizen()">
+                                    <i class="fas fa-times"></i> إلغاء
+                                </button>
+                            </div>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="material_id" class="form-label">المادة <span class="text-danger">*</span></label>
+                            <select class="form-select" id="material_id" name="material_id" required>
+                                <option value="">اختر المادة...</option>
+                                {% for material in materials %}
+                                <option value="{{ material[0] }}">{{ material[1] }} ({{ material[2] }})</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="quantity" class="form-label">الكمية <span class="text-danger">*</span></label>
+                            <input type="number" class="form-control" id="quantity" name="quantity" value="1" min="1" required>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label for="notes" class="form-label">ملاحظات</label>
+                        <textarea class="form-control" id="notes" name="notes" rows="3" placeholder="ملاحظات حول التوزيع (اختياري)"></textarea>
+                    </div>
+                    
+                    <div class="d-flex justify-content-between">
+                        <a href="{{ url_for('material_distributions') }}" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i> رجوع إلى السجل
+                        </a>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-check"></i> تسجيل التوزيع
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h6><i class="fas fa-info-circle"></i> معلومات مهمة</h6>
+            </div>
+            <div class="card-body">
+                <div class="alert alert-info">
+                    <strong>تذكير:</strong>
+                    <ul class="mb-0 mt-2">
+                        <li>تأكد من هوية المواطن قبل التوزيع</li>
+                        <li>تحقق من الكمية المناسبة</li>
+                        <li>يمكن إضافة ملاحظات للتوضيح</li>
+                        <li>سيتم حفظ تاريخ ووقت التوزيع تلقائياً</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+// بيانات المواطنين للبحث
+const citizens = [
+    {% for citizen in citizens %}
+    {
+        id: {{ citizen[0] }}, 
+        name: "{{ citizen[1] }}", 
+        national_id: "{{ citizen[2] }}"
+    }{{ "," if not loop.last }}
+    {% endfor %}
+];
+
+// وظائف البحث عن المواطنين
+document.addEventListener('DOMContentLoaded', function() {
+    const searchInput = document.getElementById('citizen_search');
+    const searchResults = document.getElementById('search_results');
+    const citizenIdInput = document.getElementById('citizen_id');
+    const selectedCitizenDiv = document.getElementById('selected_citizen');
+    const selectedCitizenName = document.getElementById('selected_citizen_name');
+    
+    // البحث أثناء الكتابة
+    searchInput.addEventListener('input', function() {
+        const query = this.value.trim().toLowerCase();
+        
+        if (query.length < 2) {
+            searchResults.style.display = 'none';
+            return;
+        }
+        
+        // فلترة النتائج
+        const filteredCitizens = citizens.filter(citizen => 
+            citizen.name.toLowerCase().includes(query) || 
+            citizen.national_id.includes(query)
+        );
+        
+        // عرض النتائج
+        if (filteredCitizens.length > 0) {
+            searchResults.innerHTML = '';
+            filteredCitizens.slice(0, 10).forEach(citizen => {
+                const item = document.createElement('a');
+                item.className = 'list-group-item list-group-item-action';
+                item.href = '#';
+                item.innerHTML = `
+                    <div class="d-flex justify-content-between">
+                        <strong>${citizen.name}</strong>
+                        <span class="badge bg-primary">${citizen.national_id}</span>
+                    </div>
+                `;
+                
+                item.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    selectCitizen(citizen);
+                });
+                
+                searchResults.appendChild(item);
+            });
+            searchResults.style.display = 'block';
+        } else {
+            searchResults.innerHTML = '<div class="list-group-item text-muted">لم يتم العثور على نتائج</div>';
+            searchResults.style.display = 'block';
+        }
+    });
+    
+    // إخفاء النتائج عند النقر خارجها
+    document.addEventListener('click', function(e) {
+        if (!searchInput.contains(e.target) && !searchResults.contains(e.target)) {
+            searchResults.style.display = 'none';
+        }
+    });
+    
+    const materialSelect = document.getElementById('material_id');
+    
+    // إضافة خاصية البحث للمواد
+    materialSelect.addEventListener('input', function() {
+        filterOptions(this);
+    });
+    
+    function filterOptions(selectElement) {
+        const filter = selectElement.value.toLowerCase();
+        const options = selectElement.querySelectorAll('option');
+        
+        options.forEach(option => {
+            if (option.value === '') return;
+            const text = option.textContent.toLowerCase();
+            option.style.display = text.includes(filter) ? '' : 'none';
+        });
+    }
+});
+
+// اختيار مواطن
+function selectCitizen(citizen) {
+    const searchInput = document.getElementById('citizen_search');
+    const searchResults = document.getElementById('search_results');
+    const citizenIdInput = document.getElementById('citizen_id');
+    const selectedCitizenDiv = document.getElementById('selected_citizen');
+    const selectedCitizenName = document.getElementById('selected_citizen_name');
+    
+    // تعيين القيم
+    citizenIdInput.value = citizen.id;
+    selectedCitizenName.textContent = `${citizen.name} (${citizen.national_id})`;
+    
+    // إخفاء البحث وعرض المختار
+    searchInput.value = '';
+    searchResults.style.display = 'none';
+    selectedCitizenDiv.style.display = 'block';
+}
+
+// إلغاء اختيار المواطن
+function clearSelectedCitizen() {
+    const citizenIdInput = document.getElementById('citizen_id');
+    const selectedCitizenDiv = document.getElementById('selected_citizen');
+    
+    citizenIdInput.value = '';
+    selectedCitizenDiv.style.display = 'none';
+}
+</script>
+{% endblock %}
