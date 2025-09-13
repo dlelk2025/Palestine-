@@ -3,7 +3,8 @@ from flask import Flask, render_template, request, redirect, url_for, flash, ses
 from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import pandas as pd
 import io
 from reportlab.pdfgen import canvas
@@ -21,11 +22,86 @@ import arabic_reshaper
 from bidi.algorithm import get_display
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-change-this'
+app.secret_key = os.environ.get("SESSION_SECRET")
+
+# Timezone configuration for Palestine (GMT+3)
+app.config['LOCAL_TIMEZONE'] = os.getenv('APP_TIMEZONE', 'Asia/Gaza')
+
+# Jinja filter to convert UTC timestamps to local time (12-hour format)
+def local_dt(timestamp_str, format_str='%Y-%m-%d %I:%M %p'):
+    """Convert UTC timestamp string to local timezone and format it in 12-hour format"""
+    if not timestamp_str:
+        return '-'
+    
+    try:
+        # Parse the timestamp (from SQLite CURRENT_TIMESTAMP)
+        if isinstance(timestamp_str, str):
+            # Remove microseconds if present
+            if '.' in timestamp_str:
+                timestamp_str = timestamp_str.split('.')[0]
+            dt = datetime.fromisoformat(timestamp_str.replace(' ', 'T'))
+        else:
+            dt = timestamp_str
+        
+        # If datetime is naive, assume it's UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        
+        # Convert to local timezone
+        local_tz = ZoneInfo(app.config['LOCAL_TIMEZONE'])
+        local_dt = dt.astimezone(local_tz)
+        
+        # Format time and translate AM/PM to Arabic
+        formatted_time = local_dt.strftime(format_str)
+        formatted_time = formatted_time.replace('AM', 'ص').replace('PM', 'م')
+        
+        return formatted_time
+    except Exception:
+        return str(timestamp_str)
+
+# Register the filter
+app.jinja_env.filters['local_dt'] = local_dt
+
+# Secure database connection with foreign key constraints enabled
+def get_db_connection():
+    """Get database connection with foreign key constraints enabled"""
+    conn = sqlite3.connect('database.db')
+    conn.execute("PRAGMA foreign_keys=ON")  # Enable foreign key constraints
+    return conn
+
+# Permission checking decorator
+from functools import wraps
+
+def require_permission(permission_name):
+    """Decorator to require specific permission for route access"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if 'user_id' not in session:
+                flash('يجب تسجيل الدخول أولاً', 'error')
+                return redirect(url_for('login'))
+            
+            if not has_permission(session['user_id'], permission_name):
+                flash(f'ليس لديك صلاحية للوصول لهذه الصفحة', 'error')
+                return redirect(url_for('dashboard'))
+            
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+def require_login(f):
+    """Decorator to require login for route access"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('يجب تسجيل الدخول أولاً', 'error')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
 
 # Database initialization
 def init_db():
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
     # Users table
@@ -54,7 +130,7 @@ def init_db():
     # Settings table
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        site_name TEXT DEFAULT 'نظام إدارة البيانات',
+        site_name TEXT DEFAULT 'هيئة فلسطين التنموية',
         site_status TEXT DEFAULT 'active',
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
@@ -106,6 +182,32 @@ def init_db():
         UNIQUE(user_id, permission_id)
     )''')
     
+    # Materials table لتخزين أنواع المواد المختلفة
+    c.execute('''CREATE TABLE IF NOT EXISTS materials (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        description TEXT,
+        unit TEXT DEFAULT 'قطعة',
+        is_active INTEGER DEFAULT 1,
+        created_by INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+    )''')
+    
+    # Material distributions table لتسجيل توزيع المواد للمواطنين
+    c.execute('''CREATE TABLE IF NOT EXISTS material_distributions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        citizen_id INTEGER NOT NULL,
+        material_id INTEGER NOT NULL,
+        quantity INTEGER DEFAULT 1,
+        distributed_by INTEGER NOT NULL,
+        distribution_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        notes TEXT,
+        FOREIGN KEY (citizen_id) REFERENCES citizens(id) ON DELETE CASCADE,
+        FOREIGN KEY (material_id) REFERENCES materials(id) ON DELETE CASCADE,
+        FOREIGN KEY (distributed_by) REFERENCES users(id) ON DELETE CASCADE
+    )''')
+    
     # Create default admin user
     c.execute("SELECT * FROM users WHERE username = 'admin'")
     if not c.fetchone():
@@ -117,7 +219,7 @@ def init_db():
     c.execute("SELECT * FROM settings")
     if not c.fetchone():
         c.execute("INSERT INTO settings (site_name, site_status) VALUES (?, ?)", 
-                 ('نظام إدارة البيانات', 'active'))
+                 ('هيئة فلسطين التنموية', 'active'))
     
     # Create default permissions
     default_permissions = [
@@ -134,7 +236,14 @@ def init_db():
         ('view_reports', 'عرض التقارير', 'التقارير'),
         ('manage_permissions', 'إدارة الصلاحيات', 'الإدارة'),
         ('view_all_data', 'عرض جميع البيانات', 'البيانات'),
-        ('manage_dynamic_fields', 'إدارة الحقول الديناميكية', 'الإدارة')
+        ('manage_dynamic_fields', 'إدارة الحقول الديناميكية', 'الإدارة'),
+        ('view_materials', 'عرض المواد', 'المواد'),
+        ('add_materials', 'إضافة المواد', 'المواد'),
+        ('edit_materials', 'تعديل المواد', 'المواد'),
+        ('delete_materials', 'حذف المواد', 'المواد'),
+        ('distribute_materials', 'توزيع المواد', 'المواد'),
+        ('view_material_distributions', 'عرض سجل توزيع المواد', 'المواد'),
+        ('manage_material_distributions', 'إدارة توزيع المواد', 'المواد')
     ]
     
     for perm_name, perm_desc, perm_category in default_permissions:
@@ -148,7 +257,7 @@ def init_db():
 
 # Check if site is active
 def is_site_active():
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT site_status FROM settings ORDER BY id DESC LIMIT 1")
     result = c.fetchone()
@@ -158,7 +267,7 @@ def is_site_active():
 # Permission checking functions
 def has_permission(user_id, permission_name):
     """التحقق من صلاحية المستخدم"""
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
     # التحقق من المدير الرئيسي
@@ -180,7 +289,7 @@ def has_permission(user_id, permission_name):
 
 def get_user_permissions(user_id):
     """الحصول على جميع صلاحيات المستخدم"""
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
     # التحقق من المدير الرئيسي
@@ -206,7 +315,7 @@ def get_user_permissions(user_id):
 
 def get_all_permissions():
     """الحصول على جميع الصلاحيات المتاحة"""
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT id, name, description, category FROM permissions ORDER BY category, name")
     permissions = c.fetchall()
@@ -224,7 +333,7 @@ def assign_default_permissions(user_id, granted_by_user_id=1):
         'view_reports'        # عرض التقارير
     ]
     
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
     try:
@@ -302,7 +411,7 @@ def login():
         username = request.form['username']
         password = request.form['password']
         
-        conn = sqlite3.connect('database.db')
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute("SELECT * FROM users WHERE username = ?", (username,))
         user = c.fetchone()
@@ -327,7 +436,7 @@ def dashboard():
     if not is_site_active() and not session.get('is_admin'):
         return render_template('maintenance.html')
     
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
     # Get statistics based on user role
@@ -394,7 +503,7 @@ def add_citizen():
             flash('عدد أفراد الأسرة لا يمكن أن يتجاوز 50', 'error')
             return render_template('add_citizen.html', form_data=form_data)
         
-        conn = sqlite3.connect('database.db')
+        conn = get_db_connection()
         c = conn.cursor()
         
         # Check if national_id already exists
@@ -438,27 +547,61 @@ def view_citizens():
     per_page = 20
     search = request.args.get('search', '')
     status_filter = request.args.get('status', '')
+    material_filter = request.args.get('material_filter', '')  # received, not_received, multiple
     
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
-    query = "SELECT * FROM citizens WHERE 1=1"
+    # Base query with material distribution counts
+    if material_filter:
+        # Use a subquery to include material distribution counts
+        query = """
+            SELECT c.*, 
+                   COALESCE(md_count.distribution_count, 0) as distribution_count
+            FROM citizens c
+            LEFT JOIN (
+                SELECT citizen_id, COUNT(*) as distribution_count
+                FROM material_distributions
+                GROUP BY citizen_id
+            ) md_count ON c.id = md_count.citizen_id
+            WHERE 1=1
+        """
+    else:
+        query = "SELECT * FROM citizens WHERE 1=1"
+    
     params = []
     
     # إذا لم يكن لديه صلاحية عرض جميع البيانات، عرض البيانات المضافة من المستخدم فقط
     if not (session.get('is_admin') or has_permission(session['user_id'], 'view_all_data')):
-        query += " AND added_by = ?"
+        query += " AND added_by = ?" if 'c.added_by' in query else " AND added_by = ?"
         params.append(session['username'])
     
     if search:
-        query += " AND (full_name LIKE ? OR national_id LIKE ? OR phone LIKE ?)"
+        if 'c.full_name' in query:
+            query += " AND (c.full_name LIKE ? OR c.national_id LIKE ? OR c.phone LIKE ?)"
+        else:
+            query += " AND (full_name LIKE ? OR national_id LIKE ? OR phone LIKE ?)"
         params.extend([f'%{search}%', f'%{search}%', f'%{search}%'])
     
     if status_filter:
-        query += " AND status = ?"
+        if 'c.status' in query:
+            query += " AND c.status = ?"
+        else:
+            query += " AND status = ?"
         params.append(status_filter)
     
-    query += " ORDER BY created_at DESC"
+    # Material distribution filtering
+    if material_filter == 'received':
+        query += " AND COALESCE(md_count.distribution_count, 0) > 0"
+    elif material_filter == 'not_received':
+        query += " AND COALESCE(md_count.distribution_count, 0) = 0"
+    elif material_filter == 'multiple':
+        query += " AND COALESCE(md_count.distribution_count, 0) > 1"
+    
+    if 'c.created_at' in query:
+        query += " ORDER BY c.created_at DESC"
+    else:
+        query += " ORDER BY created_at DESC"
     
     c.execute(query, params)
     all_citizens = c.fetchall()
@@ -470,17 +613,13 @@ def view_citizens():
     
     conn.close()
     
-    # Check if user can view all data but is not admin (should hide usernames)
-    can_view_all_data = session.get('is_admin') or has_permission(session['user_id'], 'view_all_data')
-    hide_usernames = can_view_all_data and not session.get('is_admin')
-    
     return render_template('view_citizens.html', 
                          citizens=citizens,
                          page=page,
                          total_pages=total_pages,
                          search=search,
                          status_filter=status_filter,
-                         hide_usernames=hide_usernames)
+                         material_filter=material_filter)
 
 @app.route('/admin')
 def admin():
@@ -500,7 +639,7 @@ def admin():
         flash('غير مسموح لك بالوصول لهذه الصفحة', 'error')
         return redirect(url_for('dashboard'))
     
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
     # Get all users
@@ -520,7 +659,7 @@ def edit_citizen(citizen_id):
     if 'user_id' not in session:
         return redirect(url_for('login'))
     
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
     # التحقق من صلاحية التعديل
@@ -589,34 +728,21 @@ def export():
     if 'user_id' not in session:
         return redirect(url_for('login'))
     
-    # Check if user has permission to export data
-    if not (session.get('is_admin') or has_permission(session['user_id'], 'export_data') or has_permission(session['user_id'], 'export_advanced')):
-        flash('ليس لديك صلاحية لتصدير البيانات', 'error')
-        return redirect(url_for('dashboard'))
-    
-    # Get all users if admin (for admin interface only)
+    # Get all users if admin
     users = []
     if session.get('is_admin'):
-        conn = sqlite3.connect('database.db')
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute("SELECT username FROM users ORDER BY username")
         users = [row[0] for row in c.fetchall()]
         conn.close()
     
-    # Check if user can view all data
-    can_view_all_data = session.get('is_admin') or has_permission(session['user_id'], 'view_all_data')
-    
-    return render_template('export.html', users=users, can_view_all_data=can_view_all_data)
+    return render_template('export.html', users=users)
 
 @app.route('/export_advanced', methods=['GET', 'POST'])
 def export_advanced():
     if 'user_id' not in session:
         return redirect(url_for('login'))
-    
-    # Check if user has permission to export data
-    if not (session.get('is_admin') or has_permission(session['user_id'], 'export_data') or has_permission(session['user_id'], 'export_advanced')):
-        flash('ليس لديك صلاحية لتصدير البيانات', 'error')
-        return redirect(url_for('dashboard'))
     
     # Get filter parameters
     status_filters = request.values.getlist('status')
@@ -631,49 +757,88 @@ def export_advanced():
     preview = request.values.get('preview')
     user_filters = request.values.getlist('users')
     all_users = request.values.get('all_users')
-    export_scope = request.values.get('export_scope', 'my_data')  # 'my_data' or 'all_data'
+    material_status = request.values.get('material_status', 'all')
     
-    # Build query
-    query = "SELECT * FROM citizens WHERE 1=1"
+    # Build query based on material filter
+    if material_status != 'all':
+        # Use subquery to include material distribution counts
+        query = """
+            SELECT c.*, 
+                   COALESCE(md_count.distribution_count, 0) as distribution_count
+            FROM citizens c
+            LEFT JOIN (
+                SELECT citizen_id, COUNT(*) as distribution_count
+                FROM material_distributions
+                GROUP BY citizen_id
+            ) md_count ON c.id = md_count.citizen_id
+            WHERE 1=1
+        """
+    else:
+        query = "SELECT * FROM citizens WHERE 1=1"
+    
     params = []
     
-    # Check user permissions for data access
-    can_view_all_data = session.get('is_admin') or has_permission(session['user_id'], 'view_all_data')
-    
-    # Apply data filtering based on permissions and user choice
-    if not can_view_all_data or export_scope == 'my_data':
-        # User can only see their own data OR chose to export only their data
-        query += " AND added_by = ?"
+    # إذا لم يكن مدير، عرض البيانات المضافة من المستخدم فقط
+    if not session.get('is_admin'):
+        if 'c.added_by' in query:
+            query += " AND c.added_by = ?"
+        else:
+            query += " AND added_by = ?"
         params.append(session['username'])
-    elif can_view_all_data and export_scope == 'all_data':
-        # User has permission to view all data and chose to export all data
-        # Apply admin user filters only if admin
-        if session.get('is_admin') and not all_users and user_filters:
+    else:
+        # للمدير: تطبيق فلتر المستخدمين
+        if not all_users and user_filters:
             placeholders = ','.join(['?' for _ in user_filters])
-            query += f" AND added_by IN ({placeholders})"
+            if 'c.added_by' in query:
+                query += f" AND c.added_by IN ({placeholders})"
+            else:
+                query += f" AND added_by IN ({placeholders})"
             params.extend(user_filters)
     
     # Apply filters
     if not all_status and status_filters:
         placeholders = ','.join(['?' for _ in status_filters])
-        query += f" AND status IN ({placeholders})"
+        if 'c.status' in query:
+            query += f" AND c.status IN ({placeholders})"
+        else:
+            query += f" AND status IN ({placeholders})"
         params.extend(status_filters)
     
     if date_from:
-        query += " AND date(created_at) >= ?"
+        if 'c.created_at' in query:
+            query += " AND date(c.created_at) >= ?"
+        else:
+            query += " AND date(created_at) >= ?"
         params.append(date_from)
     
     if date_to:
-        query += " AND date(created_at) <= ?"
+        if 'c.created_at' in query:
+            query += " AND date(c.created_at) <= ?"
+        else:
+            query += " AND date(created_at) <= ?"
         params.append(date_to)
     
     if search_text:
-        query += " AND (full_name LIKE ? OR national_id LIKE ?)"
+        if 'c.full_name' in query:
+            query += " AND (c.full_name LIKE ? OR c.national_id LIKE ?)"
+        else:
+            query += " AND (full_name LIKE ? OR national_id LIKE ?)"
         params.extend([f'%{search_text}%', f'%{search_text}%'])
     
-    query += " ORDER BY created_at DESC"
+    # Apply material distribution filtering
+    if material_status == 'received':
+        query += " AND COALESCE(md_count.distribution_count, 0) > 0"
+    elif material_status == 'not_received':
+        query += " AND COALESCE(md_count.distribution_count, 0) = 0"
+    elif material_status == 'multiple':
+        query += " AND COALESCE(md_count.distribution_count, 0) > 1"
     
-    conn = sqlite3.connect('database.db')
+    if 'c.created_at' in query:
+        query += " ORDER BY c.created_at DESC"
+    else:
+        query += " ORDER BY created_at DESC"
+    
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute(query, params)
     citizens = c.fetchall()
@@ -1060,7 +1225,7 @@ def export_excel():
     if 'user_id' not in session:
         return redirect(url_for('login'))
     
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     
     # تحديد الاستعلام حسب صلاحية المستخدم
     if session.get('is_admin'):
@@ -1094,13 +1259,25 @@ def citizen_details(citizen_id):
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
     
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT * FROM citizens WHERE id = ?", (citizen_id,))
     citizen = c.fetchone()
-    conn.close()
     
     if citizen:
+        # Get material distributions for this citizen
+        c.execute("""
+            SELECT m.name, md.quantity, m.unit, md.distribution_date, u.username, md.notes
+            FROM material_distributions md
+            JOIN materials m ON md.material_id = m.id
+            JOIN users u ON md.distributed_by = u.id
+            WHERE md.citizen_id = ?
+            ORDER BY md.distribution_date DESC
+        """, (citizen_id,))
+        distributions = c.fetchall()
+        
+        conn.close()
+        
         return jsonify({
             'full_name': citizen[1],
             'national_id': citizen[2],
@@ -1109,8 +1286,11 @@ def citizen_details(citizen_id):
             'family_members': citizen[5],
             'address': citizen[6],
             'notes': citizen[7],
-            'added_by': citizen[8]
+            'added_by': citizen[8],
+            'material_distributions': distributions
         })
+    
+    conn.close()
     return jsonify({'error': 'Not found'}), 404
 
 @app.route('/delete_citizen/<int:citizen_id>', methods=['DELETE'])
@@ -1138,7 +1318,7 @@ def add_user():
     password = request.form['password']
     is_admin = 1 if 'is_admin' in request.form else 0
     
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     
     try:
@@ -1218,7 +1398,7 @@ def delete_user(user_id):
     if 'user_id' not in session or not session.get('is_admin'):
         return jsonify({'error': 'Unauthorized'}), 401
     
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE id = ? AND username != 'admin'", (user_id,))
     conn.commit()
@@ -1234,7 +1414,7 @@ def update_settings():
     site_name = request.form['site_name']
     site_status = request.form['site_status']
     
-    conn = sqlite3.connect('database.db')
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("UPDATE settings SET site_name = ?, site_status = ?, updated_at = CURRENT_TIMESTAMP",
              (site_name, site_status))
@@ -1736,6 +1916,459 @@ def save_dynamic_field_values(citizen_id, form_data):
     
     conn.commit()
     conn.close()
+
+# Material Management Routes
+@app.route('/manage_materials')
+@require_permission('view_materials')
+def manage_materials():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("""
+        SELECT m.id, m.name, m.description, m.unit, m.is_active, u.username, m.created_at
+        FROM materials m
+        LEFT JOIN users u ON m.created_by = u.id
+        ORDER BY m.created_at DESC
+    """)
+    materials = c.fetchall()
+    conn.close()
+    
+    return render_template('manage_materials.html', materials=materials)
+
+@app.route('/add_material', methods=['GET', 'POST'])
+@require_permission('add_materials')
+def add_material():
+    
+    if request.method == 'POST':
+        name = request.form['name'].strip()
+        description = request.form.get('description', '').strip()
+        unit = request.form.get('unit', 'قطعة').strip()
+        
+        if len(name) < 2:
+            flash('اسم المادة يجب أن يكون حرفين على الأقل', 'error')
+            return render_template('add_material.html')
+        
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        try:
+            c.execute("INSERT INTO materials (name, description, unit, created_by) VALUES (?, ?, ?, ?)",
+                     (name, description, unit, session['user_id']))
+            conn.commit()
+            flash('تم إضافة المادة بنجاح', 'success')
+            conn.close()
+            return redirect(url_for('manage_materials'))
+            
+        except sqlite3.IntegrityError:
+            flash('اسم المادة موجود مسبقاً', 'error')
+            conn.close()
+    
+    return render_template('add_material.html')
+
+@app.route('/edit_material/<int:material_id>', methods=['GET', 'POST'])
+@require_permission('edit_materials')
+def edit_material(material_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    c.execute("SELECT * FROM materials WHERE id = ?", (material_id,))
+    material = c.fetchone()
+    
+    if not material:
+        flash('المادة غير موجودة', 'error')
+        conn.close()
+        return redirect(url_for('manage_materials'))
+    
+    if request.method == 'POST':
+        name = request.form['name'].strip()
+        description = request.form.get('description', '').strip()
+        unit = request.form.get('unit', 'قطعة').strip()
+        is_active = 1 if 'is_active' in request.form else 0
+        
+        if len(name) < 2:
+            flash('اسم المادة يجب أن يكون حرفين على الأقل', 'error')
+            conn.close()
+            return render_template('edit_material.html', material=material)
+        
+        # Check if name exists for another material
+        c.execute("SELECT id FROM materials WHERE name = ? AND id != ?", (name, material_id))
+        if c.fetchone():
+            flash('اسم المادة موجود مسبقاً لمادة أخرى', 'error')
+            conn.close()
+            return render_template('edit_material.html', material=material)
+        
+        try:
+            c.execute("UPDATE materials SET name = ?, description = ?, unit = ?, is_active = ? WHERE id = ?",
+                     (name, description, unit, is_active, material_id))
+            conn.commit()
+            flash('تم تحديث المادة بنجاح', 'success')
+            conn.close()
+            return redirect(url_for('manage_materials'))
+            
+        except Exception as e:
+            flash('خطأ في تحديث المادة', 'error')
+            conn.close()
+    
+    conn.close()
+    return render_template('edit_material.html', material=material)
+
+@app.route('/delete_material/<int:material_id>')
+@require_permission('delete_materials')
+def delete_material(material_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # Check if material has distributions
+    c.execute("SELECT COUNT(*) FROM material_distributions WHERE material_id = ?", (material_id,))
+    count = c.fetchone()[0]
+    
+    if count > 0:
+        flash('لا يمكن حذف المادة لأنها تحتوي على سجلات توزيع', 'error')
+    else:
+        c.execute("DELETE FROM materials WHERE id = ?", (material_id,))
+        conn.commit()
+        flash('تم حذف المادة بنجاح', 'success')
+    
+    conn.close()
+    return redirect(url_for('manage_materials'))
+
+@app.route('/distribute_material', methods=['GET', 'POST'])
+@require_permission('distribute_materials')
+def distribute_material():
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    if request.method == 'POST':
+        citizen_id = request.form['citizen_id']
+        material_id = request.form['material_id']
+        quantity = int(request.form.get('quantity', 1))
+        notes = request.form.get('notes', '').strip()
+        
+        try:
+            c.execute("""
+                INSERT INTO material_distributions (citizen_id, material_id, quantity, distributed_by, notes)
+                VALUES (?, ?, ?, ?, ?)
+            """, (citizen_id, material_id, quantity, session['user_id'], notes))
+            conn.commit()
+            flash('تم تسجيل توزيع المادة بنجاح', 'success')
+            conn.close()
+            return redirect(url_for('distribute_material'))
+            
+        except Exception as e:
+            flash('خطأ في تسجيل التوزيع', 'error')
+            conn.close()
+    
+    # Get active materials
+    c.execute("SELECT id, name, unit FROM materials WHERE is_active = 1 ORDER BY name")
+    materials = c.fetchall()
+    
+    # Get citizens
+    c.execute("SELECT id, full_name, national_id FROM citizens ORDER BY full_name")
+    citizens = c.fetchall()
+    
+    conn.close()
+    
+    return render_template('distribute_material.html', materials=materials, citizens=citizens)
+
+@app.route('/material_distributions')
+@require_permission('view_material_distributions')
+def material_distributions():
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("""
+        SELECT md.id, c.full_name, c.national_id, m.name, md.quantity, m.unit,
+               u.username, md.distribution_date, md.notes
+        FROM material_distributions md
+        JOIN citizens c ON md.citizen_id = c.id
+        JOIN materials m ON md.material_id = m.id
+        JOIN users u ON md.distributed_by = u.id
+        ORDER BY md.distribution_date DESC
+    """)
+    distributions = c.fetchall()
+    conn.close()
+    
+    return render_template('material_distributions.html', distributions=distributions)
+
+@app.route('/export_distributions')
+@require_permission('view_material_distributions')
+def export_distributions():
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # Get all material distributions with detailed info
+    c.execute("""
+        SELECT md.id, c.full_name, c.national_id, c.phone, m.name as material_name, 
+               md.quantity, m.unit, u.username, md.distribution_date, md.notes
+        FROM material_distributions md
+        JOIN citizens c ON md.citizen_id = c.id
+        JOIN materials m ON md.material_id = m.id
+        JOIN users u ON md.distributed_by = u.id
+        ORDER BY md.distribution_date DESC
+    """)
+    distributions = c.fetchall()
+    
+    # Convert to pandas DataFrame
+    import pandas as pd
+    from datetime import datetime
+    
+    df = pd.DataFrame(distributions, columns=[
+        'رقم التوزيع', 'اسم المواطن', 'الرقم الوطني', 'الجوال', 'المادة',
+        'الكمية', 'الوحدة', 'وزعت بواسطة', 'تاريخ التوزيع', 'ملاحظات'
+    ])
+    
+    # Format dates and data
+    if len(df) > 0:
+        # Convert UTC timestamps to local timezone (12-hour format)
+        local_tz = ZoneInfo(app.config['LOCAL_TIMEZONE'])
+        df['تاريخ التوزيع'] = pd.to_datetime(df['تاريخ التوزيع'], utc=True).dt.tz_convert(local_tz).dt.strftime('%Y-%m-%d %I:%M %p').str.replace('AM', 'ص').str.replace('PM', 'م')
+        df['ملاحظات'] = df['ملاحظات'].fillna('-')
+        df['الكمية مع الوحدة'] = df['الكمية'].astype(str) + ' ' + df['الوحدة']
+        
+        # Reorder columns for better export
+        df = df[['رقم التوزيع', 'اسم المواطن', 'الرقم الوطني', 'الجوال', 
+                'المادة', 'الكمية مع الوحدة', 'وزعت بواسطة', 'تاريخ التوزيع', 'ملاحظات']]
+    
+    # Export to Excel
+    from flask import make_response
+    from io import BytesIO
+    
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='سجل توزيع المواد', index=False)
+    
+    output.seek(0)
+    
+    response = make_response(output.read())
+    # Use local time for filename timestamp
+    local_tz = ZoneInfo(app.config['LOCAL_TIMEZONE'])
+    local_now = datetime.now(timezone.utc).astimezone(local_tz)
+    response.headers['Content-Disposition'] = f'attachment; filename=material_distributions_export_{local_now.strftime("%Y%m%d_%H%M%S")}.xlsx'
+    response.headers['Content-type'] = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    
+    conn.close()
+    
+    return response
+
+@app.route('/edit_distribution/<int:distribution_id>', methods=['GET', 'POST'])
+@require_permission('distribute_materials')
+def edit_distribution(distribution_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    if request.method == 'POST':
+        try:
+            material_id = request.form.get('material_id')
+            quantity = request.form.get('quantity')
+            notes = request.form.get('notes', '')
+            
+            if not material_id or not quantity:
+                flash('جميع الحقول المطلوبة يجب ملؤها', 'error')
+                return redirect(request.url)
+            
+            # Update the distribution
+            c.execute("""
+                UPDATE material_distributions 
+                SET material_id = ?, quantity = ?, notes = ?
+                WHERE id = ?
+            """, (material_id, quantity, notes, distribution_id))
+            conn.commit()
+            
+            flash('تم تحديث التوزيع بنجاح', 'success')
+            conn.close()
+            return redirect(url_for('material_distributions'))
+            
+        except Exception as e:
+            flash('خطأ في تحديث التوزيع', 'error')
+            conn.close()
+            return redirect(url_for('material_distributions'))
+    
+    # Get distribution details
+    c.execute("""
+        SELECT md.id, md.citizen_id, c.full_name, c.national_id, 
+               md.material_id, m.name, md.quantity, md.notes
+        FROM material_distributions md
+        JOIN citizens c ON md.citizen_id = c.id
+        JOIN materials m ON md.material_id = m.id
+        WHERE md.id = ?
+    """, (distribution_id,))
+    distribution = c.fetchone()
+    
+    if not distribution:
+        flash('التوزيع غير موجود', 'error')
+        conn.close()
+        return redirect(url_for('material_distributions'))
+    
+    # Get active materials
+    c.execute("SELECT id, name, unit FROM materials WHERE is_active = 1 ORDER BY name")
+    materials = c.fetchall()
+    
+    conn.close()
+    
+    return render_template('edit_distribution.html', distribution=distribution, materials=materials)
+
+@app.route('/delete_distribution/<int:distribution_id>')
+@require_permission('delete_materials')
+def delete_distribution(distribution_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    try:
+        # Check if distribution exists
+        c.execute("SELECT id FROM material_distributions WHERE id = ?", (distribution_id,))
+        if not c.fetchone():
+            flash('التوزيع غير موجود', 'error')
+            conn.close()
+            return redirect(url_for('material_distributions'))
+        
+        # Delete the distribution
+        c.execute("DELETE FROM material_distributions WHERE id = ?", (distribution_id,))
+        conn.commit()
+        
+        flash('تم حذف التوزيع بنجاح', 'success')
+        
+    except Exception as e:
+        flash('خطأ في حذف التوزيع', 'error')
+    
+    conn.close()
+    return redirect(url_for('material_distributions'))
+
+@app.route('/export_materials')
+@require_permission('view_materials')
+def export_materials():
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # Get all materials with user info
+    c.execute("""
+        SELECT m.id, m.name, m.description, m.unit, 
+               CASE WHEN m.is_active = 1 THEN 'نشطة' ELSE 'معطلة' END as status,
+               u.username, m.created_at
+        FROM materials m
+        JOIN users u ON m.created_by = u.id
+        ORDER BY m.created_at DESC
+    """)
+    materials = c.fetchall()
+    
+    # Convert to pandas DataFrame
+    import pandas as pd
+    from datetime import datetime
+    
+    df = pd.DataFrame(materials, columns=[
+        'رقم المادة', 'اسم المادة', 'الوصف', 'الوحدة', 
+        'الحالة', 'أضيفت بواسطة', 'تاريخ الإضافة'
+    ])
+    
+    # Format dates
+    if len(df) > 0:
+        # Convert UTC timestamps to local timezone (12-hour format)
+        local_tz = ZoneInfo(app.config['LOCAL_TIMEZONE'])
+        df['تاريخ الإضافة'] = pd.to_datetime(df['تاريخ الإضافة'], utc=True).dt.tz_convert(local_tz).dt.strftime('%Y-%m-%d %I:%M %p').str.replace('AM', 'ص').str.replace('PM', 'م')
+        
+        # Fill empty descriptions
+        df['الوصف'] = df['الوصف'].fillna('-')
+    
+    # Export to Excel
+    from flask import make_response
+    from io import BytesIO
+    
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='قائمة المواد', index=False)
+    
+    output.seek(0)
+    
+    response = make_response(output.read())
+    # Use local time for filename timestamp
+    local_tz = ZoneInfo(app.config['LOCAL_TIMEZONE'])
+    local_now = datetime.now(timezone.utc).astimezone(local_tz)
+    response.headers['Content-Disposition'] = f'attachment; filename=materials_export_{local_now.strftime("%Y%m%d_%H%M%S")}.xlsx'
+    response.headers['Content-type'] = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    
+    conn.close()
+    
+    return response
+
+@app.route('/export_citizen_materials/<int:citizen_id>')
+@require_permission('view_distributions')
+def export_citizen_materials(citizen_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # Get citizen information
+    c.execute("SELECT full_name, national_id FROM citizens WHERE id = ?", (citizen_id,))
+    citizen = c.fetchone()
+    
+    if not citizen:
+        conn.close()
+        flash('المواطن غير موجود', 'error')
+        return redirect(url_for('view_citizens'))
+    
+    # Get material distributions for this citizen
+    c.execute("""
+        SELECT m.name, md.quantity, m.unit, md.distribution_date, u.username, md.notes
+        FROM material_distributions md
+        JOIN materials m ON md.material_id = m.id
+        JOIN users u ON md.distributed_by = u.id
+        WHERE md.citizen_id = ?
+        ORDER BY md.distribution_date DESC
+    """, (citizen_id,))
+    distributions = c.fetchall()
+    
+    conn.close()
+    
+    if not distributions:
+        flash('لا توجد مواد مستلمة لهذا المواطن', 'error')
+        return redirect(url_for('view_citizens'))
+    
+    # Create DataFrame
+    import pandas as pd
+    df = pd.DataFrame(distributions, columns=[
+        'اسم المادة', 'الكمية', 'الوحدة', 'تاريخ الاستلام', 'المسلم بواسطة', 'ملاحظات'
+    ])
+    
+    # Format dates and data
+    if len(df) > 0:
+        # Convert UTC timestamps to local timezone (12-hour format)
+        local_tz = ZoneInfo(app.config['LOCAL_TIMEZONE'])
+        df['تاريخ الاستلام'] = pd.to_datetime(df['تاريخ الاستلام'], utc=True).dt.tz_convert(local_tz).dt.strftime('%Y-%m-%d %I:%M %p').str.replace('AM', 'ص').str.replace('PM', 'م')
+        df['ملاحظات'] = df['ملاحظات'].fillna('-')
+        df['الكمية مع الوحدة'] = df['الكمية'].astype(str) + ' ' + df['الوحدة']
+        
+        # Reorder columns for better export
+        df = df[['اسم المادة', 'الكمية مع الوحدة', 'تاريخ الاستلام', 'المسلم بواسطة', 'ملاحظات']]
+    
+    # Export to Excel
+    from flask import make_response
+    from io import BytesIO
+    
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='سجل المواد', index=False)
+        
+        # Get worksheet to add citizen info
+        worksheet = writer.sheets['سجل المواد']
+        
+        # Insert rows at the top for citizen info
+        worksheet.insert_rows(1, 3)
+        worksheet['A1'] = f'الاسم: {citizen[0]}'
+        worksheet['A2'] = f'الرقم الوطني: {citizen[1]}'
+        # A3 will be empty for spacing
+    
+    output.seek(0)
+    
+    response = make_response(output.read())
+    # Use local time for filename timestamp
+    local_tz = ZoneInfo(app.config['LOCAL_TIMEZONE'])
+    local_now = datetime.now(timezone.utc).astimezone(local_tz)
+    # Use only ASCII characters for filename to avoid encoding issues
+    import urllib.parse
+    safe_name = f"citizen_{citizen_id}"  # Use citizen_id (integer) instead of name/national_id
+    filename = f"{safe_name}_materials_{local_now.strftime('%Y%m%d_%H%M%S')}.xlsx"
+    # URL encode filename to handle any special characters
+    encoded_filename = urllib.parse.quote(filename)
+    response.headers['Content-Disposition'] = f'attachment; filename="{encoded_filename}"'
+    response.headers['Content-type'] = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    
+    return response
 
 @app.route('/export_pdf')
 def export_pdf():
