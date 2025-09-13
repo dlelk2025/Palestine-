@@ -27,6 +27,9 @@ app.secret_key = os.environ.get("SESSION_SECRET")
 # Timezone configuration for Palestine (GMT+3)
 app.config['LOCAL_TIMEZONE'] = os.getenv('APP_TIMEZONE', 'Asia/Gaza')
 
+# حد أقصى لحجم الملفات المرفوعة (حماية من DoS)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB
+
 # Jinja filter to convert UTC timestamps to local time (12-hour format)
 def local_dt(timestamp_str, format_str='%Y-%m-%d %I:%M %p'):
     """Convert UTC timestamp string to local timezone and format it in 12-hour format"""
@@ -1311,12 +1314,18 @@ def delete_citizen(citizen_id):
 
 @app.route('/add_user', methods=['POST'])
 def add_user():
-    if 'user_id' not in session or not session.get('is_admin'):
-        return redirect(url_for('login'))
+    if 'user_id' not in session or not (session.get('is_admin') or has_permission(session['user_id'], 'manage_users')):
+        flash('ليس لديك صلاحية إدارة المستخدمين', 'error')
+        return redirect(url_for('dashboard'))
     
     username = request.form['username']
     password = request.form['password']
     is_admin = 1 if 'is_admin' in request.form else 0
+    
+    # منع المستخدمين غير المديرين من إنشاء حسابات مديرين
+    if is_admin == 1 and not session.get('is_admin'):
+        flash('ليس لديك صلاحية إنشاء حسابات مديرين', 'error')
+        return redirect(url_for('admin'))
     
     conn = get_db_connection()
     c = conn.cursor()
@@ -1510,7 +1519,7 @@ def restore_backup():
             flash('لم يتم اختيار ملف', 'error')
             return redirect(url_for('restore_backup'))
         
-        if file and (file.filename.endswith('.db') or file.filename.endswith('.zip')):
+        if file and file.filename and (file.filename.endswith('.db') or file.filename.endswith('.zip')):
             try:
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 
@@ -1607,10 +1616,371 @@ def restore_backup():
     
     return render_template('restore_backup.html')
 
+@app.route('/restore_backup_enhanced', methods=['GET', 'POST'])
+def restore_backup_enhanced():
+    """نظام استعادة النسخة الاحتياطية المحسن مع خيارات متعددة"""
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    
+    if not (session.get('is_admin') or has_permission(session['user_id'], 'restore_database')):
+        flash('غير مسموح لك باستعادة نسخ احتياطية', 'error')
+        return redirect(url_for('dashboard'))
+    
+    if request.method == 'POST':
+        if 'backup_file' not in request.files:
+            flash('لم يتم اختيار ملف', 'error')
+            return redirect(url_for('restore_backup_enhanced'))
+        
+        file = request.files['backup_file']
+        restore_type = request.form.get('restore_type', 'full')
+        
+        if file.filename == '':
+            flash('لم يتم اختيار ملف', 'error')
+            return redirect(url_for('restore_backup_enhanced'))
+        
+        if not (file and file.filename and file.filename.endswith('.zip')):
+            flash('يجب أن يكون الملف من نوع .zip للاستعادة المحسنة', 'error')
+            return redirect(url_for('restore_backup_enhanced'))
+        
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            result = perform_enhanced_restore(file, restore_type, timestamp)
+            
+            if result['success']:
+                flash(result['message'], 'success')
+            else:
+                flash(result['message'], 'error')
+                
+        except Exception as e:
+            flash(f'خطأ في استعادة النسخة الاحتياطية: {str(e)}', 'error')
+        
+        return redirect(url_for('admin'))
+    
+    return render_template('restore_backup_enhanced.html')
+
+def perform_enhanced_restore(file, restore_type, timestamp):
+    """تنفيذ الاستعادة المحسنة حسب النوع المحدد"""
+    try:
+        # إنشاء مجلد مؤقت للاستخراج
+        temp_path = f'temp_restore_{timestamp}'
+        os.makedirs(temp_path, exist_ok=True)
+        
+        # حفظ واستخراج الملف
+        file.save(f'{temp_path}/restore.zip')
+        
+        restored_components = []
+        
+        with zipfile.ZipFile(f'{temp_path}/restore.zip', 'r') as zip_file:
+            # فحص أمان الملفات قبل الاستخراج
+            if not validate_zip_contents(zip_file):
+                return {'success': False, 'message': 'ملف ZIP يحتوي على مسارات غير آمنة'}
+            
+            # استخراج آمن للملفات
+            safe_extract_zip(zip_file, temp_path)
+            
+            # التحقق من وجود ملف البيانات الوصفية
+            metadata_path = f'{temp_path}/backup_metadata.json'
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    metadata = json.loads(f.read())
+                    backup_type = metadata.get('backup_type', 'unknown')
+                    backup_date = metadata.get('backup_date', 'unknown')
+            
+            if restore_type == 'structure_only':
+                result = restore_structure_only(temp_path, timestamp)
+                
+            elif restore_type == 'data_only':
+                result = restore_data_only(temp_path, timestamp)
+                
+            elif restore_type == 'full':
+                result = restore_full_backup(temp_path, timestamp)
+                
+            else:
+                result = {'success': False, 'message': 'نوع الاستعادة غير مدعوم'}
+        
+        # تنظيف المجلد المؤقت
+        shutil.rmtree(temp_path)
+        return result
+        
+    except Exception as e:
+        # تنظيف في حالة الخطأ
+        if os.path.exists(temp_path):
+            shutil.rmtree(temp_path)
+        return {'success': False, 'message': f'خطأ في المعالجة: {str(e)}'}
+
+def restore_structure_only(temp_path, timestamp):
+    """استعادة البنية فقط (الكود + القوالب + الملفات الثابتة) مع الحفاظ على البيانات"""
+    restored_components = []
+    
+    try:
+        # إنشاء نسخة احتياطية من الحالة الحالية
+        create_current_backup_before_restore(timestamp, backup_data=False)
+        
+        # استعادة ملف التطبيق الرئيسي (app.py)
+        app_file_path = f'{temp_path}/app.py'
+        if os.path.exists(app_file_path):
+            # إنشاء نسخة احتياطية من app.py الحالي
+            shutil.copy2('app.py', f'app_backup_before_structure_restore_{timestamp}.py')
+            shutil.copy2(app_file_path, 'app.py')
+            restored_components.append('ملف التطبيق الرئيسي')
+        
+        # استعادة القوالب
+        templates_path = f'{temp_path}/templates'
+        if os.path.exists(templates_path):
+            if not os.path.exists('templates'):
+                os.makedirs('templates')
+            for template_file in os.listdir(templates_path):
+                if template_file.endswith('.html'):
+                    shutil.copy2(f'{templates_path}/{template_file}', f'templates/{template_file}')
+            restored_components.append('قوالب HTML')
+        
+        # استعادة الملفات الثابتة
+        static_path = f'{temp_path}/static'
+        if os.path.exists(static_path):
+            if not os.path.exists('static'):
+                os.makedirs('static')
+            for root, dirs, files in os.walk(static_path):
+                for file_name in files:
+                    source_file = os.path.join(root, file_name)
+                    relative_path = os.path.relpath(source_file, static_path)
+                    target_file = os.path.join('static', relative_path)
+                    target_dir = os.path.dirname(target_file)
+                    if not os.path.exists(target_dir):
+                        os.makedirs(target_dir)
+                    shutil.copy2(source_file, target_file)
+            restored_components.append('الملفات الثابتة')
+        
+        if restored_components:
+            message = f'تم استعادة البنية بنجاح مع الحفاظ على البيانات الحالية. تم استعادة: {", ".join(restored_components)}'
+            return {'success': True, 'message': message}
+        else:
+            return {'success': False, 'message': 'لم يتم العثور على ملفات البنية في النسخة الاحتياطية'}
+    
+    except Exception as e:
+        return {'success': False, 'message': f'خطأ في استعادة البنية: {str(e)}'}
+
+def restore_data_only(temp_path, timestamp):
+    """استعادة البيانات فقط (قاعدة البيانات)"""
+    try:
+        database_path = f'{temp_path}/database.db'
+        if os.path.exists(database_path):
+            # إنشاء نسخة احتياطية من قاعدة البيانات الحالية
+            shutil.copy2('database.db', f'database_backup_before_data_restore_{timestamp}.db')
+            # استعادة قاعدة البيانات
+            shutil.copy2(database_path, 'database.db')
+            return {'success': True, 'message': 'تم استعادة البيانات بنجاح مع الحفاظ على البنية الحالية'}
+        else:
+            return {'success': False, 'message': 'لم يتم العثور على قاعدة البيانات في النسخة الاحتياطية'}
+    
+    except Exception as e:
+        return {'success': False, 'message': f'خطأ في استعادة البيانات: {str(e)}'}
+
+def restore_full_backup(temp_path, timestamp):
+    """استعادة البنية والبيانات معاً (استعادة كاملة)"""
+    restored_components = []
+    
+    try:
+        # إنشاء نسخة احتياطية شاملة من الحالة الحالية
+        create_current_backup_before_restore(timestamp, backup_data=True)
+        
+        # استعادة قاعدة البيانات
+        database_path = f'{temp_path}/database.db'
+        if os.path.exists(database_path):
+            shutil.copy2(database_path, 'database.db')
+            restored_components.append('قاعدة البيانات')
+        
+        # استعادة ملف التطبيق الرئيسي
+        app_file_path = f'{temp_path}/app.py'
+        if os.path.exists(app_file_path):
+            shutil.copy2(app_file_path, 'app.py')
+            restored_components.append('ملف التطبيق الرئيسي')
+        
+        # استعادة القوالب
+        templates_path = f'{temp_path}/templates'
+        if os.path.exists(templates_path):
+            if not os.path.exists('templates'):
+                os.makedirs('templates')
+            for template_file in os.listdir(templates_path):
+                if template_file.endswith('.html'):
+                    shutil.copy2(f'{templates_path}/{template_file}', f'templates/{template_file}')
+            restored_components.append('قوالب HTML')
+        
+        # استعادة الملفات الثابتة
+        static_path = f'{temp_path}/static'
+        if os.path.exists(static_path):
+            if not os.path.exists('static'):
+                os.makedirs('static')
+            for root, dirs, files in os.walk(static_path):
+                for file_name in files:
+                    source_file = os.path.join(root, file_name)
+                    relative_path = os.path.relpath(source_file, static_path)
+                    target_file = os.path.join('static', relative_path)
+                    target_dir = os.path.dirname(target_file)
+                    if not os.path.exists(target_dir):
+                        os.makedirs(target_dir)
+                    shutil.copy2(source_file, target_file)
+            restored_components.append('الملفات الثابتة')
+        
+        if restored_components:
+            message = f'تم استعادة النسخة الاحتياطية الكاملة بنجاح. تم استعادة: {", ".join(restored_components)}'
+            return {'success': True, 'message': message}
+        else:
+            return {'success': False, 'message': 'لم يتم العثور على ملفات صالحة للاستعادة في النسخة الاحتياطية'}
+    
+    except Exception as e:
+        return {'success': False, 'message': f'خطأ في الاستعادة الكاملة: {str(e)}'}
+
+def create_current_backup_before_restore(timestamp, backup_data=True):
+    """إنشاء نسخة احتياطية من الحالة الحالية قبل الاستعادة"""
+    try:
+        backup_filename = f'auto_backup_before_restore_{timestamp}.zip'
+        
+        with zipfile.ZipFile(backup_filename, 'w', zipfile.ZIP_DEFLATED) as backup_zip:
+            # نسخ احتياطية من قاعدة البيانات إذا كان مطلوباً
+            if backup_data and os.path.exists('database.db'):
+                backup_zip.write('database.db', 'database.db')
+            
+            # نسخ احتياطية من app.py
+            if os.path.exists('app.py'):
+                backup_zip.write('app.py', 'app.py')
+            
+            # نسخ احتياطية من القوالب
+            if os.path.exists('templates'):
+                for template_file in os.listdir('templates'):
+                    if template_file.endswith('.html'):
+                        backup_zip.write(f'templates/{template_file}', f'templates/{template_file}')
+            
+            # نسخ احتياطية من الملفات الثابتة
+            if os.path.exists('static'):
+                for root, dirs, files in os.walk('static'):
+                    for file_name in files:
+                        file_path = os.path.join(root, file_name)
+                        arcname = os.path.relpath(file_path, '.')
+                        backup_zip.write(file_path, arcname)
+            
+            # إضافة البيانات الوصفية
+            metadata = {
+                'backup_date': datetime.now().isoformat(),
+                'backup_type': 'auto_before_restore',
+                'admin_user': session.get('username', 'unknown'),
+                'version': '1.0',
+                'includes_data': backup_data
+            }
+            backup_zip.writestr('backup_metadata.json', json.dumps(metadata, ensure_ascii=False, indent=2))
+        
+        return True
+    
+    except Exception as e:
+        print(f"خطأ في إنشاء النسخة الاحتياطية التلقائية: {e}")
+        return False
+
+def validate_zip_contents(zip_file):
+    """التحقق من أن محتويات ملف ZIP آمنة ولا تحتوي على مسارات خطرة"""
+    allowed_files = {
+        'app.py', 'database.db', 'backup_metadata.json'
+    }
+    allowed_prefixes = ('templates/', 'static/')
+    
+    # حدود الحماية من قنابل الضغط
+    MAX_FILES = 1000
+    MAX_TOTAL_SIZE = 100 * 1024 * 1024  # 100 MB
+    MAX_FILE_SIZE = 50 * 1024 * 1024    # 50 MB per file
+    MAX_COMPRESSION_RATIO = 100         # نسبة ضغط قصوى
+    
+    try:
+        file_list = zip_file.namelist()
+        
+        # فحص عدد الملفات
+        if len(file_list) > MAX_FILES:
+            return False
+        
+        total_uncompressed_size = 0
+        
+        for member_name in file_list:
+            try:
+                info = zip_file.getinfo(member_name)
+            except KeyError:
+                return False
+            
+            # تحويل المسار إلى مسار آمن
+            member_path = os.path.normpath(member_name)
+            
+            # رفض المسارات المطلقة
+            if os.path.isabs(member_path):
+                return False
+            
+            # رفض المسارات التي تحتوي على ".."
+            if '..' in member_path or '../' in member_name or '..\\' in member_name:
+                return False
+            
+            # رفض المسارات التي تبدأ بـ "/" أو "\"
+            if member_path.startswith(('/','\\')) or member_name.startswith(('/','\\', '\\\\')):
+                return False
+            
+            # رفض أسماء الملفات التي تحتوي على محارف Windows الخطرة
+            if any(char in member_name for char in [':', '*', '?', '"', '<', '>', '|']):
+                return False
+            
+            # التحقق من الروابط المميزة والروابط الصلبة
+            if info.external_attr & 0o170000 == 0o120000:  # symlink check
+                return False
+            
+            # فحص حجم الملف المضغوط وغير المضغوط
+            if info.file_size > MAX_FILE_SIZE:
+                return False
+            
+            total_uncompressed_size += info.file_size
+            if total_uncompressed_size > MAX_TOTAL_SIZE:
+                return False
+            
+            # فحص نسبة الضغط لتجنب قنابل الضغط
+            if info.compress_size > 0:
+                compression_ratio = info.file_size / info.compress_size
+                if compression_ratio > MAX_COMPRESSION_RATIO:
+                    return False
+            
+            # التحقق من أن الملف مسموح به (تخطي المجلدات)
+            if not member_name.endswith('/'):
+                if member_path not in allowed_files:
+                    # التحقق من أن الملف يبدأ بأحد البادئات المسموحة
+                    if not any(member_path.startswith(prefix) for prefix in allowed_prefixes):
+                        return False
+        
+        return True
+    
+    except Exception:
+        return False
+
+def safe_extract_zip(zip_file, extract_to):
+    """استخراج آمن لملفات ZIP مع حماية من Zip Slip"""
+    for member in zip_file.namelist():
+        # تحويل المسار إلى مسار آمن
+        member_path = os.path.normpath(member)
+        
+        # التأكد من أن المسار النهائي داخل مجلد الاستخراج
+        full_path = os.path.join(extract_to, member_path)
+        full_path = os.path.normpath(full_path)
+        
+        # التحقق من أن المسار لا يخرج من مجلد الاستخراج
+        if not full_path.startswith(os.path.normpath(extract_to) + os.sep):
+            if not full_path == os.path.normpath(extract_to):
+                continue  # تخطي الملفات غير الآمنة
+        
+        # إنشاء المجلدات اللازمة
+        dir_path = os.path.dirname(full_path)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path, exist_ok=True)
+        
+        # استخراج الملف إذا لم يكن مجلداً
+        if not member.endswith('/'):
+            with zip_file.open(member) as source, open(full_path, 'wb') as target:
+                target.write(source.read())
+
 @app.route('/edit_user/<int:user_id>', methods=['GET', 'POST'])
 def edit_user(user_id):
-    if 'user_id' not in session or not session.get('is_admin'):
-        return redirect(url_for('login'))
+    if 'user_id' not in session or not (session.get('is_admin') or has_permission(session['user_id'], 'manage_users')):
+        flash('ليس لديك صلاحية إدارة المستخدمين', 'error')
+        return redirect(url_for('dashboard'))
     
     conn = sqlite3.connect('database.db')
     c = conn.cursor()
@@ -1630,10 +2000,37 @@ def edit_user(user_id):
         conn.close()
         return redirect(url_for('admin'))
     
+    # منع المستخدمين غير المديرين من تعديل أي مستخدم مدير
+    if user[2] == 1 and not session.get('is_admin'):  # user[2] is is_admin field
+        flash('ليس لديك صلاحية تعديل حسابات المديرين', 'error')
+        conn.close()
+        return redirect(url_for('admin'))
+    
     if request.method == 'POST':
         new_username = request.form['username']
         new_password = request.form.get('password')
         is_admin = 1 if 'is_admin' in request.form else 0
+        
+        # منع المستخدمين من تعديل حساباتهم الشخصية
+        if user_id == session['user_id']:
+            flash('لا يمكنك تعديل حسابك الشخصي من هذه الصفحة', 'error')
+            conn.close()
+            return redirect(url_for('admin'))
+        
+        # منع المستخدمين غير المديرين من ترقية المستخدمين لمديرين
+        if is_admin == 1 and not session.get('is_admin'):
+            flash('ليس لديك صلاحية ترقية المستخدمين لمديرين', 'error')
+            conn.close()
+            return redirect(url_for('admin'))
+        
+        # منع خفض رتبة المدير الأخير المتبقي
+        if user[2] == 1 and is_admin == 0:  # محاولة خفض رتبة مدير
+            c.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+            admin_count = c.fetchone()[0]
+            if admin_count <= 1:
+                flash('لا يمكن خفض رتبة المدير الأخير المتبقي', 'error')
+                conn.close()
+                return redirect(url_for('admin'))
         
         # Validation
         if len(new_username.strip()) < 3:
@@ -1691,6 +2088,44 @@ def manage_permissions(user_id):
     
     if request.method == 'POST':
         selected_permissions = request.form.getlist('permissions')
+        
+        # منع المستخدمين من تعديل صلاحياتهم الشخصية
+        if user_id == session['user_id']:
+            flash('لا يمكنك تعديل صلاحياتك الشخصية', 'error')
+            conn.close()
+            return redirect(url_for('admin'))
+        
+        # منع المستخدمين غير المديرين من تعديل صلاحيات المديرين
+        if user[2] == 1 and not session.get('is_admin'):  # user[2] is is_admin field
+            flash('ليس لديك صلاحية تعديل صلاحيات المديرين', 'error')
+            conn.close()
+            return redirect(url_for('admin'))
+        
+        # فحص هرمية الصلاحيات - التأكد من أن المستخدم يمكنه منح الصلاحيات المحددة
+        if not session.get('is_admin'):  # المديرون لهم جميع الصلاحيات
+            current_user_permissions = get_user_permissions(session['user_id'])
+            current_user_permission_ids = []
+            
+            # الحصول على معرفات صلاحيات المستخدم الحالي
+            conn_temp = sqlite3.connect('database.db')
+            c_temp = conn_temp.cursor()
+            c_temp.execute("""
+                SELECT p.id FROM user_permissions up 
+                JOIN permissions p ON up.permission_id = p.id 
+                WHERE up.user_id = ?
+            """, (session['user_id'],))
+            current_user_permission_ids = [row[0] for row in c_temp.fetchall()]
+            conn_temp.close()
+            
+            # التحقق من أن جميع الصلاحيات المحددة متاحة للمستخدم الحالي
+            for perm_id in selected_permissions:
+                if int(perm_id) not in current_user_permission_ids:
+                    c.execute("SELECT name FROM permissions WHERE id = ?", (int(perm_id),))
+                    perm_name = c.fetchone()
+                    perm_name = perm_name[0] if perm_name else "غير معروف"
+                    flash(f'لا يمكنك منح صلاحية "{perm_name}" لأنك لا تملكها', 'error')
+                    conn.close()
+                    return redirect(url_for('admin'))
         
         try:
             # حذف الصلاحيات الحالية للمستخدم
