@@ -3,6 +3,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, ses
 from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3
 import os
+import secrets
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -20,9 +21,34 @@ import zipfile
 from pathlib import Path
 import arabic_reshaper
 from bidi.algorithm import get_display
+import uuid
+import requests
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET")
+
+# Generate CSRF token for forms
+def generate_csrf_token():
+    if 'csrf_token' not in session:
+        session['csrf_token'] = secrets.token_hex(16)
+    return session['csrf_token']
+
+def validate_csrf_token(token):
+    return token and session.get('csrf_token') == token
+
+app.jinja_env.globals['csrf_token'] = generate_csrf_token
+
+# CSRF Protection decorator
+def csrf_protect(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if request.method == 'POST':
+            token = request.form.get('csrf_token')
+            if not validate_csrf_token(token):
+                flash('رمز الأمان غير صحيح. يرجى المحاولة مرة أخرى.', 'error')
+                return redirect(request.referrer or url_for('dashboard'))
+        return f(*args, **kwargs)
+    return decorated_function
 
 # Timezone configuration for Palestine (GMT+3)
 app.config['LOCAL_TIMEZONE'] = os.getenv('APP_TIMEZONE', 'Asia/Gaza')
@@ -113,8 +139,16 @@ def init_db():
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
         is_admin INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        session_token TEXT DEFAULT NULL
     )''')
+    
+    # إضافة عمود session_token للجداول الموجودة (للتوافق مع النسخة القديمة)
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN session_token TEXT DEFAULT NULL')
+    except sqlite3.OperationalError:
+        # العمود موجود بالفعل
+        pass
     
     # Citizens data table
     c.execute('''CREATE TABLE IF NOT EXISTS citizens (
@@ -127,13 +161,21 @@ def init_db():
         address TEXT NOT NULL,
         notes TEXT,
         added_by TEXT NOT NULL,
+        assigned_to TEXT DEFAULT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+    
+    # إضافة عمود assigned_to للجداول الموجودة (للتوافق مع النسخة القديمة)
+    try:
+        c.execute('ALTER TABLE citizens ADD COLUMN assigned_to TEXT DEFAULT NULL')
+    except sqlite3.OperationalError:
+        # العمود موجود بالفعل
+        pass
     
     # Settings table
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        site_name TEXT DEFAULT 'هيئة فلسطين التنموية',
+        site_name TEXT DEFAULT 'نظام البيانات الحديث',
         site_status TEXT DEFAULT 'active',
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
@@ -211,6 +253,23 @@ def init_db():
         FOREIGN KEY (distributed_by) REFERENCES users(id) ON DELETE CASCADE
     )''')
     
+    # Telegram backup settings table لإعدادات النسخ الاحتياطي التلقائي عبر تيليجرام
+    c.execute('''CREATE TABLE IF NOT EXISTS telegram_backup_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_token TEXT DEFAULT NULL,
+        chat_id TEXT DEFAULT NULL,
+        is_enabled INTEGER DEFAULT 0,
+        backup_on_citizen_changes INTEGER DEFAULT 1,
+        backup_on_user_changes INTEGER DEFAULT 1,
+        backup_on_material_changes INTEGER DEFAULT 1,
+        backup_on_settings_changes INTEGER DEFAULT 1,
+        backup_on_permission_changes INTEGER DEFAULT 1,
+        last_backup_sent TIMESTAMP DEFAULT NULL,
+        backup_file_name_pattern TEXT DEFAULT 'backup_{timestamp}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
     # Create default admin user
     c.execute("SELECT * FROM users WHERE username = 'admin'")
     if not c.fetchone():
@@ -222,7 +281,16 @@ def init_db():
     c.execute("SELECT * FROM settings")
     if not c.fetchone():
         c.execute("INSERT INTO settings (site_name, site_status) VALUES (?, ?)", 
-                 ('هيئة فلسطين التنموية', 'active'))
+                 ('نظام البيانات الحديث', 'active'))
+    
+    # Create default Telegram backup settings
+    c.execute("SELECT * FROM telegram_backup_settings")
+    if not c.fetchone():
+        c.execute("""INSERT INTO telegram_backup_settings 
+                     (is_enabled, backup_on_citizen_changes, backup_on_user_changes, 
+                      backup_on_material_changes, backup_on_settings_changes, 
+                      backup_on_permission_changes, backup_file_name_pattern) 
+                     VALUES (0, 1, 1, 1, 1, 1, 'backup_{timestamp}')""")
     
     # Create default permissions
     default_permissions = [
@@ -246,7 +314,13 @@ def init_db():
         ('delete_materials', 'حذف المواد', 'المواد'),
         ('distribute_materials', 'توزيع المواد', 'المواد'),
         ('view_material_distributions', 'عرض سجل توزيع المواد', 'المواد'),
-        ('manage_material_distributions', 'إدارة توزيع المواد', 'المواد')
+        ('manage_material_distributions', 'إدارة توزيع المواد', 'المواد'),
+        ('reset_citizens_data', 'تصفير بيانات المواطنين', 'تصفير قاعدة البيانات'),
+        ('reset_users_data', 'تصفير بيانات المستخدمين', 'تصفير قاعدة البيانات'),
+        ('reset_materials_data', 'تصفير بيانات المواد', 'تصفير قاعدة البيانات'),
+        ('reset_all_data', 'تصفير جميع البيانات (عدا الإدمن)', 'تصفير قاعدة البيانات'),
+        ('import_citizens_excel', 'استيراد بيانات المواطنين من Excel', 'استيراد البيانات'),
+        ('manage_telegram_backup', 'إدارة النسخ الاحتياطي التلقائي عبر تيليجرام', 'النسخ الاحتياطية')
     ]
     
     for perm_name, perm_desc, perm_category in default_permissions:
@@ -391,6 +465,205 @@ def inject_permission_functions():
         current_user_permissions=get_current_user_permissions
     )
 
+# دوال إدارة الجلسات وإبطالها تلقائياً
+def generate_session_token():
+    """توليد token فريد للجلسة"""
+    return secrets.token_urlsafe(32)
+
+def invalidate_user_session(user_id):
+    """إبطال جلسة مستخدم معين عن طريق تحديث session_token"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    new_token = generate_session_token()
+    c.execute("UPDATE users SET session_token = ? WHERE id = ?", (new_token, user_id))
+    conn.commit()
+    conn.close()
+
+def validate_session():
+    """التحقق من صحة الجلسة الحالية"""
+    if 'user_id' not in session:
+        return False
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT session_token FROM users WHERE id = ?", (session['user_id'],))
+    result = c.fetchone()
+    conn.close()
+    
+    if not result:
+        return False
+    
+    # إذا لم يكن هناك token في قاعدة البيانات (حساب قديم) والجلسة لا تحتوي على token، اقبل الجلسة
+    if result[0] is None and 'session_token' not in session:
+        return True
+    
+    # إذا كان هناك token في قاعدة البيانات، يجب أن يتطابق مع token الجلسة
+    if result[0] is not None:
+        return result[0] == session.get('session_token')
+    
+    # حالات أخرى (DB token is None لكن الجلسة تحتوي على token) - رفض
+    return False
+
+def check_session_validity():
+    """فحص صحة الجلسة وإخراج المستخدم إذا لم تعد صالحة"""
+    if 'user_id' in session:
+        if not validate_session():
+            session.clear()
+            flash('تم إنهاء جلستك لأسباب أمنية. يرجى تسجيل الدخول مرة أخرى.', 'warning')
+            return redirect(url_for('login'))
+    return None
+
+# Telegram Backup Functions
+def get_telegram_backup_settings():
+    """الحصول على إعدادات النسخ الاحتياطي عبر تيليجرام"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM telegram_backup_settings ORDER BY id DESC LIMIT 1")
+    result = c.fetchone()
+    conn.close()
+    return result
+
+def send_file_to_telegram(bot_token, chat_id, file_path, caption=None):
+    """إرسال ملف إلى تيليجرام"""
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+        
+        with open(file_path, 'rb') as file:
+            files = {'document': file}
+            data = {'chat_id': chat_id}
+            if caption:
+                data['caption'] = caption
+            
+            response = requests.post(url, files=files, data=data, timeout=60)
+            
+        if response.status_code == 200:
+            return True, "تم إرسال الملف بنجاح"
+        else:
+            return False, f"فشل في إرسال الملف: {response.status_code} - {response.text}"
+    
+    except Exception as e:
+        return False, f"خطأ في إرسال الملف: {str(e)}"
+
+def send_backup_to_telegram(backup_type="full", trigger_action="manual"):
+    """إنشاء وإرسال نسخة احتياطية إلى تيليجرام"""
+    try:
+        # الحصول على إعدادات تيليجرام
+        settings = get_telegram_backup_settings()
+        if not settings or not settings[3]:  # is_enabled
+            return False, "النسخ الاحتياطي التلقائي غير مفعل"
+        
+        if not settings[1] or not settings[2]:  # bot_token, chat_id
+            return False, "إعدادات تيليجرام غير مكتملة"
+        
+        bot_token = settings[1]
+        chat_id = settings[2]
+        
+        # إنشاء النسخة الاحتياطية
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_filename = f"auto_backup_{timestamp}.zip"
+        
+        # إنشاء نسخة احتياطية شاملة
+        backup_buffer = io.BytesIO()
+        with zipfile.ZipFile(backup_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # إضافة قاعدة البيانات
+            if os.path.exists('database.db'):
+                zip_file.write('database.db', 'database.db')
+            
+            # إضافة ملفات التطبيق
+            zip_file.write('app.py', 'app.py')
+            
+            # إضافة القوالب
+            for template_file in os.listdir('templates'):
+                if template_file.endswith('.html'):
+                    zip_file.write(f'templates/{template_file}', f'templates/{template_file}')
+            
+            # إضافة الملفات الثابتة إذا كانت موجودة
+            if os.path.exists('static'):
+                for root, dirs, files in os.walk('static'):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, '.')
+                        zip_file.write(file_path, arcname)
+            
+            # إضافة معلومات النسخة الاحتياطية
+            metadata = {
+                'backup_date': datetime.now().isoformat(),
+                'backup_type': backup_type,
+                'trigger_action': trigger_action,
+                'system_version': '1.0'
+            }
+            zip_file.writestr('backup_metadata.json', json.dumps(metadata, ensure_ascii=False, indent=2))
+        
+        # حفظ النسخة الاحتياطية في ملف مؤقت
+        backup_buffer.seek(0)
+        with open(backup_filename, 'wb') as f:
+            f.write(backup_buffer.getvalue())
+        
+        # إرسال النسخة الاحتياطية إلى تيليجرام
+        caption = f"🔄 نسخة احتياطية تلقائية\n📅 التاريخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n⚡ السبب: {trigger_action}\n📁 النوع: {backup_type}"
+        
+        success, message = send_file_to_telegram(bot_token, chat_id, backup_filename, caption)
+        
+        # حذف الملف المؤقت
+        if os.path.exists(backup_filename):
+            os.remove(backup_filename)
+        
+        if success:
+            # تحديث تاريخ آخر نسخة احتياطية
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("UPDATE telegram_backup_settings SET last_backup_sent = CURRENT_TIMESTAMP")
+            conn.commit()
+            conn.close()
+            
+            return True, f"تم إرسال النسخة الاحتياطية بنجاح إلى تيليجرام"
+        else:
+            return False, f"فشل في إرسال النسخة الاحتياطية: {message}"
+    
+    except Exception as e:
+        return False, f"خطأ في إنشاء النسخة الاحتياطية: {str(e)}"
+
+def trigger_automatic_backup(action_type):
+    """تفعيل النسخ الاحتياطي التلقائي بناءً على نوع العملية"""
+    try:
+        # الحصول على إعدادات تيليجرام
+        settings = get_telegram_backup_settings()
+        if not settings or not settings[3]:  # is_enabled
+            return
+        
+        # فحص ما إذا كان النوع المحدد مفعلاً للنسخ الاحتياطي
+        should_backup = False
+        
+        if action_type == 'citizen' and settings[4]:  # backup_on_citizen_changes
+            should_backup = True
+        elif action_type == 'user' and settings[5]:  # backup_on_user_changes
+            should_backup = True
+        elif action_type == 'material' and settings[6]:  # backup_on_material_changes
+            should_backup = True
+        elif action_type == 'settings' and settings[7]:  # backup_on_settings_changes
+            should_backup = True
+        elif action_type == 'permission' and settings[8]:  # backup_on_permission_changes
+            should_backup = True
+        
+        if should_backup:
+            # تشغيل النسخ الاحتياطي في الخلفية (بدون توقف التطبيق)
+            send_backup_to_telegram("auto", f"تعديل في {action_type}")
+    
+    except Exception as e:
+        # تسجيل الخطأ بصمت دون إيقاف التطبيق
+        print(f"خطأ في النسخ الاحتياطي التلقائي: {e}")
+
+@app.before_request
+def before_request():
+    """فحص الجلسة قبل كل طلب"""
+    # استثناء صفحات معينة من فحص الجلسة
+    excluded_endpoints = ['login', 'static', 'index']
+    if request.endpoint and request.endpoint not in excluded_endpoints:
+        response = check_session_validity()
+        if response:
+            return response
+    return None
+
 # Routes
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -421,14 +694,130 @@ def login():
         conn.close()
         
         if user and check_password_hash(user[2], password):
+            # إنشاء session token جديد وحفظه في قاعدة البيانات
+            session_token = generate_session_token()
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("UPDATE users SET session_token = ? WHERE id = ?", (session_token, user[0]))
+            conn.commit()
+            conn.close()
+            
+            # حفظ بيانات الجلسة
             session['user_id'] = user[0]
             session['username'] = user[1]
             session['is_admin'] = user[3]
+            session['session_token'] = session_token
             return redirect(url_for('dashboard'))
         else:
             flash('اسم المستخدم أو كلمة المرور غير صحيحة', 'error')
     
     return render_template('login.html')
+
+@app.route('/public_inquiry', methods=['GET', 'POST'])
+def public_inquiry():
+    """صفحة الاستعلام العام للزوار لمعرفة المواد المسلمة"""
+    
+    if not is_site_active():
+        return render_template('maintenance.html')
+    
+    citizen_data = None
+    materials_received = []
+    search_performed = False
+    
+    if request.method == 'POST':
+        search_type = request.form.get('search_type', 'national_id').strip()
+        search_term = request.form.get('search_term', '').strip()
+        full_name_search = request.form.get('full_name_search', '').strip()
+        
+        # تحديد نوع البحث والقيم
+        search_performed = True
+        citizen_result = None
+        
+        # Validation before opening database connection
+        if search_type == 'national_id' and search_term:
+            # البحث بالرقم الوطني
+            # Server-side validation: التأكد من أن المدخل هو رقم وطني صحيح (11 رقم)
+            if not search_term.isdigit() or len(search_term) != 11:
+                flash('يجب إدخال رقم وطني صحيح مكون من 11 رقم فقط', 'error')
+                return render_template('public_inquiry.html', 
+                                     citizen_data=None,
+                                     materials_received=[],
+                                     search_performed=True)
+        elif search_type == 'full_name' and full_name_search:
+            # البحث بالاسم الثلاثي
+            # Server-side validation: التأكد من أن الاسم ليس فارغاً ولا يحتوي على أرقام فقط
+            if len(full_name_search.strip()) < 3:
+                flash('يجب إدخال الاسم الثلاثي كاملاً (3 أحرف على الأقل)', 'error')
+                return render_template('public_inquiry.html', 
+                                     citizen_data=None,
+                                     materials_received=[],
+                                     search_performed=True)
+            
+            if full_name_search.strip().isdigit():
+                flash('الاسم لا يمكن أن يكون أرقام فقط', 'error')
+                return render_template('public_inquiry.html', 
+                                     citizen_data=None,
+                                     materials_received=[],
+                                     search_performed=True)
+        else:
+            # لم يتم إدخال قيم البحث
+            flash('يجب إدخال قيمة للبحث', 'error')
+            return render_template('public_inquiry.html', 
+                                 citizen_data=None,
+                                 materials_received=[],
+                                 search_performed=True)
+        
+        # Open database connection after validation
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        try:
+            if search_type == 'national_id' and search_term:
+                # البحث بالرقم الوطني (بحث دقيق)
+                c.execute("""
+                    SELECT id, full_name, status 
+                    FROM citizens 
+                    WHERE national_id = ?
+                """, (search_term,))
+                
+                citizen_result = c.fetchone()
+                
+            elif search_type == 'full_name' and full_name_search:
+                # البحث بالاسم الثلاثي (بحث دقيق - مطابقة تامة)
+                c.execute("""
+                    SELECT id, full_name, status 
+                    FROM citizens 
+                    WHERE full_name = ?
+                """, (full_name_search.strip(),))
+                
+                citizen_result = c.fetchone()
+            
+            # معالجة نتائج البحث (مشتركة لكلا النوعين)
+            if citizen_result:
+                citizen_data = {
+                    'id': citizen_result[0],
+                    'full_name': citizen_result[1],
+                    'status': citizen_result[2]
+                }
+                
+                # جلب المواد المسلمة لهذا المواطن (بدون ملاحظات لأمان أكبر)
+                c.execute("""
+                    SELECT m.name, md.quantity, m.unit, md.distribution_date
+                    FROM material_distributions md
+                    JOIN materials m ON md.material_id = m.id
+                    WHERE md.citizen_id = ?
+                    ORDER BY md.distribution_date DESC
+                """, (citizen_result[0],))
+                
+                materials_received = c.fetchall()
+                
+        finally:
+            conn.close()
+    
+    return render_template('public_inquiry.html', 
+                         citizen_data=citizen_data,
+                         materials_received=materials_received,
+                         search_performed=search_performed)
 
 @app.route('/dashboard')
 def dashboard():
@@ -534,6 +923,10 @@ def add_citizen():
             conn.commit()
             flash('تم إضافة البيانات بنجاح', 'success')
             conn.close()
+            
+            # تفعيل النسخ الاحتياطي التلقائي
+            trigger_automatic_backup('citizen')
+            
             return redirect(url_for('dashboard'))
         except Exception as e:
             flash('خطأ في إضافة البيانات', 'error')
@@ -657,6 +1050,118 @@ def admin():
     
     return render_template('admin.html', users=users, settings=settings)
 
+@app.route('/telegram_backup_settings', methods=['GET', 'POST'])
+@require_permission('manage_telegram_backup')
+@csrf_protect
+def telegram_backup_settings():
+    if request.method == 'POST':
+        bot_token = request.form.get('bot_token', '').strip()
+        chat_id = request.form.get('chat_id', '').strip()
+        is_enabled = 1 if 'is_enabled' in request.form else 0
+        backup_on_citizen_changes = 1 if 'backup_on_citizen_changes' in request.form else 0
+        backup_on_user_changes = 1 if 'backup_on_user_changes' in request.form else 0
+        backup_on_material_changes = 1 if 'backup_on_material_changes' in request.form else 0
+        backup_on_settings_changes = 1 if 'backup_on_settings_changes' in request.form else 0
+        backup_on_permission_changes = 1 if 'backup_on_permission_changes' in request.form else 0
+        backup_file_name_pattern = request.form.get('backup_file_name_pattern', 'backup_{timestamp}').strip()
+        
+        # Test connection if enabled and credentials provided
+        if is_enabled and bot_token and chat_id:
+            # Only test if bot_token is not the masked placeholder
+            if bot_token != '***':
+                test_success, test_message = test_telegram_connection(bot_token, chat_id)
+                if not test_success:
+                    flash(f'فشل في اختبار الاتصال مع تيليجرام: {test_message}', 'error')
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute("SELECT * FROM telegram_backup_settings ORDER BY id DESC LIMIT 1")
+                settings = c.fetchone()
+                conn.close()
+                return render_template('telegram_backup_settings.html', settings=settings)
+        
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        # Update or insert settings
+        c.execute("SELECT id, bot_token FROM telegram_backup_settings ORDER BY id DESC LIMIT 1")
+        existing = c.fetchone()
+        
+        # If bot_token is masked, preserve the existing one
+        if bot_token == '***' and existing and existing[1]:
+            bot_token = existing[1]
+        
+        if existing:
+            c.execute("""UPDATE telegram_backup_settings SET 
+                         bot_token = ?, chat_id = ?, is_enabled = ?, 
+                         backup_on_citizen_changes = ?, backup_on_user_changes = ?, 
+                         backup_on_material_changes = ?, backup_on_settings_changes = ?, 
+                         backup_on_permission_changes = ?, backup_file_name_pattern = ?,
+                         updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                     (bot_token, chat_id, is_enabled, backup_on_citizen_changes, 
+                      backup_on_user_changes, backup_on_material_changes, 
+                      backup_on_settings_changes, backup_on_permission_changes,
+                      backup_file_name_pattern, existing[0]))
+        else:
+            c.execute("""INSERT INTO telegram_backup_settings 
+                         (bot_token, chat_id, is_enabled, backup_on_citizen_changes, 
+                          backup_on_user_changes, backup_on_material_changes, 
+                          backup_on_settings_changes, backup_on_permission_changes, 
+                          backup_file_name_pattern) 
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     (bot_token, chat_id, is_enabled, backup_on_citizen_changes, 
+                      backup_on_user_changes, backup_on_material_changes, 
+                      backup_on_settings_changes, backup_on_permission_changes,
+                      backup_file_name_pattern))
+        
+        conn.commit()
+        conn.close()
+        
+        flash('تم حفظ إعدادات النسخ الاحتياطي التلقائي بنجاح', 'success')
+        return redirect(url_for('telegram_backup_settings'))
+    
+    # GET request
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM telegram_backup_settings ORDER BY id DESC LIMIT 1")
+    settings = c.fetchone()
+    conn.close()
+    
+    return render_template('telegram_backup_settings.html', settings=settings)
+
+def test_telegram_connection(bot_token, chat_id):
+    """اختبار الاتصال مع تيليجرام"""
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data = {
+            'chat_id': chat_id,
+            'text': '🔗 اختبار الاتصال مع نظام النسخ الاحتياطي التلقائي\n✅ تم تكوين الإعدادات بنجاح'
+        }
+        response = requests.post(url, data=data, timeout=10)
+        
+        if response.status_code == 200:
+            return True, "تم الاتصال بنجاح"
+        else:
+            return False, f"رمز الخطأ: {response.status_code} - {response.text}"
+    
+    except Exception as e:
+        return False, f"خطأ في الاتصال: {str(e)}"
+
+@app.route('/test_telegram_backup', methods=['POST'])
+@require_permission('manage_telegram_backup')
+@csrf_protect
+def test_telegram_backup():
+    """اختبار إرسال نسخة احتياطية يدوياً"""
+    try:
+        success, message = send_backup_to_telegram("manual_test", "اختبار يدوي من لوحة الإدارة")
+        
+        if success:
+            return jsonify({'success': True, 'message': message})
+        else:
+            return jsonify({'success': False, 'message': message})
+    
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'خطأ في الاختبار: {str(e)}'})
+
 @app.route('/edit_citizen/<int:citizen_id>', methods=['GET', 'POST'])
 def edit_citizen(citizen_id):
     if 'user_id' not in session:
@@ -686,54 +1191,97 @@ def edit_citizen(citizen_id):
         address = request.form['address']
         notes = request.form.get('notes', '')
         
+        # معالجة assigned_to للمديرين فقط مع validation
+        assigned_to = None
+        if session.get('is_admin'):
+            assigned_to_input = request.form.get('assigned_to', '').strip()
+            if assigned_to_input:
+                # التحقق من وجود المستخدم
+                c.execute("SELECT username FROM users WHERE username = ?", (assigned_to_input,))
+                if c.fetchone():
+                    assigned_to = assigned_to_input
+                else:
+                    return render_error('المستخدم المحدد غير موجود')
+        
+        # Helper function لإعادة عرض الصفحة مع المستخدمين في حالة الخطأ
+        def render_error(message):
+            flash(message, 'error')
+            users = []
+            if session.get('is_admin'):
+                c.execute("SELECT id, username FROM users ORDER BY username")
+                users = c.fetchall()
+            conn.close()
+            return render_template('edit_citizen.html', citizen=citizen, users=users)
+        
         # Validation
         if len(national_id) != 11 or not national_id.isdigit():
-            flash('الرقم الوطني يجب أن يكون 11 رقم', 'error')
-            conn.close()
-            return render_template('edit_citizen.html', citizen=citizen)
+            return render_error('الرقم الوطني يجب أن يكون 11 رقم')
         
         if len(phone) != 10 or not phone.startswith('09') or not phone.isdigit():
-            flash('رقم الجوال يجب أن يكون 10 أرقام ويبدأ ب 09', 'error')
-            conn.close()
-            return render_template('edit_citizen.html', citizen=citizen)
+            return render_error('رقم الجوال يجب أن يكون 10 أرقام ويبدأ ب 09')
         
         if family_members > 50:
-            flash('عدد أفراد الأسرة لا يمكن أن يتجاوز 50', 'error')
-            conn.close()
-            return render_template('edit_citizen.html', citizen=citizen)
+            return render_error('عدد أفراد الأسرة لا يمكن أن يتجاوز 50')
         
         # Check if national_id already exists for another citizen
         c.execute("SELECT * FROM citizens WHERE national_id = ? AND id != ?", (national_id, citizen_id))
         if c.fetchone():
-            flash('الرقم الوطني مسجل مسبقاً لمواطن آخر', 'error')
-            conn.close()
-            return render_template('edit_citizen.html', citizen=citizen)
+            return render_error('الرقم الوطني مسجل مسبقاً لمواطن آخر')
         
         try:
-            c.execute('''UPDATE citizens SET 
-                        full_name = ?, national_id = ?, phone = ?, status = ?, 
-                        family_members = ?, address = ?, notes = ?
-                        WHERE id = ?''',
-                     (full_name, national_id, phone, status, family_members, address, notes, citizen_id))
+            if session.get('is_admin'):
+                # المديرون يمكنهم تحديث assigned_to
+                # عند نسب البيانات لمستخدم، يصبح ذلك المستخدم هو من أضاف البيانات
+                if assigned_to:
+                    # نسب البيانات: تحديث كل من assigned_to و added_by
+                    c.execute('''UPDATE citizens SET 
+                                full_name = ?, national_id = ?, phone = ?, status = ?, 
+                                family_members = ?, address = ?, notes = ?, assigned_to = ?, added_by = ?
+                                WHERE id = ?''',
+                             (full_name, national_id, phone, status, family_members, address, notes, assigned_to, assigned_to, citizen_id))
+                else:
+                    # إلغاء النسب: تحديث assigned_to فقط (نحافظ على added_by الأصلي)
+                    c.execute('''UPDATE citizens SET 
+                                full_name = ?, national_id = ?, phone = ?, status = ?, 
+                                family_members = ?, address = ?, notes = ?, assigned_to = ?
+                                WHERE id = ?''',
+                             (full_name, national_id, phone, status, family_members, address, notes, assigned_to, citizen_id))
+            else:
+                # المستخدمون العاديون لا يمكنهم تحديث assigned_to (نحافظ على القيمة الحالية)
+                c.execute('''UPDATE citizens SET 
+                            full_name = ?, national_id = ?, phone = ?, status = ?, 
+                            family_members = ?, address = ?, notes = ?
+                            WHERE id = ?''',
+                         (full_name, national_id, phone, status, family_members, address, notes, citizen_id))
             conn.commit()
             flash('تم تحديث البيانات بنجاح', 'success')
             conn.close()
+            
+            # تفعيل النسخ الاحتياطي التلقائي
+            trigger_automatic_backup('citizen')
+            
             return redirect(url_for('view_citizens'))
         except Exception as e:
             flash('خطأ في تحديث البيانات', 'error')
             conn.close()
     
+    # جلب قائمة المستخدمين للمديرين فقط
+    users = []
+    if session.get('is_admin'):
+        c.execute("SELECT id, username FROM users ORDER BY username")
+        users = c.fetchall()
+    
     conn.close()
-    return render_template('edit_citizen.html', citizen=citizen)
+    return render_template('edit_citizen.html', citizen=citizen, users=users)
 
 @app.route('/export')
 def export():
     if 'user_id' not in session:
         return redirect(url_for('login'))
     
-    # Get all users if admin
+    # Get all users if admin or has manage_users permission
     users = []
-    if session.get('is_admin'):
+    if session.get('is_admin') or has_permission(session['user_id'], 'manage_users'):
         conn = get_db_connection()
         c = conn.cursor()
         c.execute("SELECT username FROM users ORDER BY username")
@@ -781,15 +1329,15 @@ def export_advanced():
     
     params = []
     
-    # إذا لم يكن مدير، عرض البيانات المضافة من المستخدم فقط
-    if not session.get('is_admin'):
+    # إذا لم يكن مدير أو لا يملك صلاحية إدارة المستخدمين، عرض البيانات المضافة من المستخدم فقط
+    if not (session.get('is_admin') or has_permission(session['user_id'], 'manage_users')):
         if 'c.added_by' in query:
             query += " AND c.added_by = ?"
         else:
             query += " AND added_by = ?"
         params.append(session['username'])
     else:
-        # للمدير: تطبيق فلتر المستخدمين
+        # للمدير أو من لديه صلاحية إدارة المستخدمين: تطبيق فلتر المستخدمين
         if not all_users and user_filters:
             placeholders = ','.join(['?' for _ in user_filters])
             if 'c.added_by' in query:
@@ -1310,6 +1858,9 @@ def delete_citizen(citizen_id):
     conn.commit()
     conn.close()
     
+    # تفعيل النسخ الاحتياطي التلقائي
+    trigger_automatic_backup('citizen')
+    
     return jsonify({'success': True})
 
 @app.route('/add_user', methods=['POST'])
@@ -1340,6 +1891,9 @@ def add_user():
         
         conn.commit()
         conn.close()
+        
+        # تفعيل النسخ الاحتياطي التلقائي
+        trigger_automatic_backup('user')
         
         # تطبيق الصلاحيات الافتراضية للمستخدمين العاديين فقط
         if is_admin == 0:
@@ -1404,14 +1958,20 @@ def apply_default_permissions_all():
 
 @app.route('/delete_user/<int:user_id>', methods=['DELETE'])
 def delete_user(user_id):
-    if 'user_id' not in session or not session.get('is_admin'):
+    if 'user_id' not in session or not (session.get('is_admin') or has_permission(session['user_id'], 'manage_users')):
         return jsonify({'error': 'Unauthorized'}), 401
+    
+    # إخراج المستخدم من النظام تلقائياً قبل حذفه
+    invalidate_user_session(user_id)
     
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE id = ? AND username != 'admin'", (user_id,))
     conn.commit()
     conn.close()
+    
+    # تفعيل النسخ الاحتياطي التلقائي
+    trigger_automatic_backup('user')
     
     return jsonify({'success': True})
 
@@ -1429,6 +1989,9 @@ def update_settings():
              (site_name, site_status))
     conn.commit()
     conn.close()
+    
+    # تفعيل النسخ الاحتياطي التلقائي
+    trigger_automatic_backup('settings')
     
     flash('تم تحديث الإعدادات بنجاح', 'success')
     return redirect(url_for('admin'))
@@ -2059,6 +2622,12 @@ def edit_user(user_id):
             conn.commit()
             flash('تم تحديث بيانات المستخدم بنجاح', 'success')
             conn.close()
+            
+            # تفعيل النسخ الاحتياطي التلقائي
+            trigger_automatic_backup('user')
+            
+            # إخراج المستخدم من النظام تلقائياً بعد تعديل بياناته
+            invalidate_user_session(user_id)
             return redirect(url_for('admin'))
             
         except sqlite3.IntegrityError:
@@ -2146,6 +2715,9 @@ def manage_permissions(user_id):
                     continue
             
             conn.commit()
+            
+            # تفعيل النسخ الاحتياطي التلقائي
+            trigger_automatic_backup('permission')
             
             if inserted_count > 0:
                 flash(f'تم تحديث صلاحيات المستخدم بنجاح. تم حفظ {inserted_count} صلاحية', 'success')
@@ -2391,6 +2963,10 @@ def add_material():
             conn.commit()
             flash('تم إضافة المادة بنجاح', 'success')
             conn.close()
+            
+            # تفعيل النسخ الاحتياطي التلقائي
+            trigger_automatic_backup('material')
+            
             return redirect(url_for('manage_materials'))
             
         except sqlite3.IntegrityError:
@@ -2437,6 +3013,10 @@ def edit_material(material_id):
             conn.commit()
             flash('تم تحديث المادة بنجاح', 'success')
             conn.close()
+            
+            # تفعيل النسخ الاحتياطي التلقائي
+            trigger_automatic_backup('material')
+            
             return redirect(url_for('manage_materials'))
             
         except Exception as e:
@@ -2462,6 +3042,9 @@ def delete_material(material_id):
         c.execute("DELETE FROM materials WHERE id = ?", (material_id,))
         conn.commit()
         flash('تم حذف المادة بنجاح', 'success')
+        
+        # تفعيل النسخ الاحتياطي التلقائي
+        trigger_automatic_backup('material')
     
     conn.close()
     return redirect(url_for('manage_materials'))
@@ -2473,23 +3056,43 @@ def distribute_material():
     c = conn.cursor()
     
     if request.method == 'POST':
-        citizen_id = request.form['citizen_id']
+        # الحصول على قائمة المواطنين المختارين
+        citizen_ids = request.form.getlist('citizen_ids[]')
         material_id = request.form['material_id']
         quantity = int(request.form.get('quantity', 1))
         notes = request.form.get('notes', '').strip()
         
+        # التحقق من اختيار مواطن واحد على الأقل
+        if not citizen_ids:
+            flash('يجب اختيار مواطن واحد على الأقل', 'error')
+            conn.close()
+            return redirect(url_for('distribute_material'))
+        
         try:
-            c.execute("""
-                INSERT INTO material_distributions (citizen_id, material_id, quantity, distributed_by, notes)
-                VALUES (?, ?, ?, ?, ?)
-            """, (citizen_id, material_id, quantity, session['user_id'], notes))
+            # إنشاء سجل توزيع منفصل لكل مواطن
+            for citizen_id in citizen_ids:
+                c.execute("""
+                    INSERT INTO material_distributions (citizen_id, material_id, quantity, distributed_by, notes)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (citizen_id, material_id, quantity, session['user_id'], notes))
+            
             conn.commit()
-            flash('تم تسجيل توزيع المادة بنجاح', 'success')
+            
+            # تفعيل النسخ الاحتياطي التلقائي
+            trigger_automatic_backup('material')
+            
+            # رسالة نجاح تتضمن عدد المواطنين
+            citizens_count = len(citizen_ids)
+            if citizens_count == 1:
+                flash('تم تسجيل توزيع المادة للمواطن بنجاح', 'success')
+            else:
+                flash(f'تم تسجيل توزيع المادة لـ {citizens_count} مواطن بنجاح', 'success')
+            
             conn.close()
             return redirect(url_for('distribute_material'))
             
         except Exception as e:
-            flash('خطأ في تسجيل التوزيع', 'error')
+            flash(f'خطأ في تسجيل التوزيع: {str(e)}', 'error')
             conn.close()
     
     # Get active materials
@@ -2852,6 +3455,350 @@ def export_pdf():
         as_attachment=True,
         download_name=f'citizens_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf',
         mimetype='application/pdf'
+    )
+
+# Database Reset Routes
+@app.route('/database_reset')
+@require_login
+def database_reset():
+    """صفحة إدارة تصفير قاعدة البيانات"""
+    # فحص الصلاحيات - يجب أن يكون لديه إحدى صلاحيات التصفير
+    reset_permissions = ['reset_citizens_data', 'reset_users_data', 'reset_materials_data', 'reset_all_data']
+    has_any_reset_permission = any(has_permission(session['user_id'], perm) for perm in reset_permissions)
+    
+    if not has_any_reset_permission:
+        flash('ليس لديك صلاحية للوصول لهذه الصفحة', 'error')
+        return redirect(url_for('dashboard'))
+    
+    return render_template('database_reset.html')
+
+@app.route('/reset_citizens_data', methods=['POST'])
+@require_permission('reset_citizens_data')
+@csrf_protect
+def reset_citizens_data():
+    """تصفير بيانات المواطنين"""
+    
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        # حذف بيانات الحقول الديناميكية أولاً
+        c.execute("DELETE FROM dynamic_field_values")
+        # حذف توزيع المواد للمواطنين
+        c.execute("DELETE FROM material_distributions")
+        # حذف بيانات المواطنين
+        c.execute("DELETE FROM citizens")
+        
+        conn.commit()
+        conn.close()
+        
+        flash('تم تصفير بيانات المواطنين بنجاح', 'success')
+    except Exception as e:
+        flash(f'خطأ في تصفير بيانات المواطنين: {str(e)}', 'error')
+    
+    return redirect(url_for('database_reset'))
+
+@app.route('/reset_users_data', methods=['POST'])
+@require_permission('reset_users_data')
+@csrf_protect
+def reset_users_data():
+    """تصفير بيانات المستخدمين (عدا الإدمن الأساسي)"""
+    
+    try:
+        # التأكد من وجود إدمن أساسي قبل الحذف
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+        admin_count = c.fetchone()[0]
+        if admin_count < 1:
+            flash('خطأ: لا يوجد مدير أساسي في النظام. العملية ملغاة لحماية النظام.', 'error')
+            conn.close()
+            return redirect(url_for('database_reset'))
+        
+        # حذف صلاحيات المستخدمين أولاً
+        c.execute("DELETE FROM user_permissions WHERE user_id NOT IN (SELECT id FROM users WHERE username = 'admin')")
+        # حذف المستخدمين (عدا الإدمن الأساسي)
+        c.execute("DELETE FROM users WHERE username != 'admin'")
+        
+        conn.commit()
+        conn.close()
+        
+        flash('تم تصفير بيانات المستخدمين بنجاح (تم الاحتفاظ بالإدمن الأساسي)', 'success')
+    except Exception as e:
+        flash(f'خطأ في تصفير بيانات المستخدمين: {str(e)}', 'error')
+    
+    return redirect(url_for('database_reset'))
+
+@app.route('/reset_materials_data', methods=['POST'])
+@require_permission('reset_materials_data')
+@csrf_protect
+def reset_materials_data():
+    """تصفير بيانات المواد"""
+    
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        # حذف توزيع المواد أولاً
+        c.execute("DELETE FROM material_distributions")
+        # حذف المواد
+        c.execute("DELETE FROM materials")
+        
+        conn.commit()
+        conn.close()
+        
+        flash('تم تصفير بيانات المواد بنجاح', 'success')
+    except Exception as e:
+        flash(f'خطأ في تصفير بيانات المواد: {str(e)}', 'error')
+    
+    return redirect(url_for('database_reset'))
+
+@app.route('/reset_all_data', methods=['POST'])
+@require_permission('reset_all_data')
+@csrf_protect
+def reset_all_data():
+    """تصفير جميع البيانات عدا الإدمن الأساسي"""
+    
+    # إضافة تأكيد إضافي للعملية الخطيرة
+    confirmation = request.form.get('confirmation', '').strip()
+    if confirmation != 'تأكيد التصفير':
+        flash('يجب كتابة "تأكيد التصفير" بدقة لتنفيذ هذه العملية', 'error')
+        return redirect(url_for('database_reset'))
+    
+    try:
+        # التأكد من وجود إدمن أساسي قبل الحذف  
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1 AND username = 'admin'")
+        admin_count = c.fetchone()[0]
+        if admin_count < 1:
+            flash('خطأ: لا يوجد مدير أساسي في النظام. العملية ملغاة لحماية النظام.', 'error')
+            conn.close()
+            return redirect(url_for('database_reset'))
+        
+        # حذف البيانات بالترتيب الصحيح لتجنب مشاكل المفاتيح الخارجية
+        c.execute("DELETE FROM dynamic_field_values")
+        c.execute("DELETE FROM material_distributions")
+        c.execute("DELETE FROM citizens")
+        c.execute("DELETE FROM materials")
+        c.execute("DELETE FROM user_permissions WHERE user_id NOT IN (SELECT id FROM users WHERE username = 'admin')")
+        c.execute("DELETE FROM users WHERE username != 'admin'")
+        
+        conn.commit()
+        conn.close()
+        
+        flash('تم تصفير جميع البيانات بنجاح (تم الاحتفاظ بالإدمن الأساسي)', 'success')
+    except Exception as e:
+        flash(f'خطأ في تصفير البيانات: {str(e)}', 'error')
+    
+    return redirect(url_for('database_reset'))
+
+# Excel Import Routes
+@app.route('/import_citizens')
+@require_permission('import_citizens_excel')
+def import_citizens():
+    """صفحة استيراد بيانات المواطنين من Excel"""
+    # الحصول على قائمة المستخدمين لتحديد من سيُنسب إليه البيانات
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, username FROM users ORDER BY username")
+    users = c.fetchall()
+    conn.close()
+    
+    return render_template('import_citizens.html', users=users)
+
+@app.route('/import_citizens_process', methods=['POST'])
+@require_permission('import_citizens_excel')
+@csrf_protect
+def import_citizens_process():
+    """معالجة استيراد بيانات المواطنين من Excel"""
+    
+    if 'excel_file' not in request.files:
+        flash('لم يتم اختيار ملف Excel', 'error')
+        return redirect(url_for('import_citizens'))
+    
+    file = request.files['excel_file']
+    if file.filename == '':
+        flash('لم يتم اختيار ملف', 'error')
+        return redirect(url_for('import_citizens'))
+    
+    # التحقق من امتداد الملف ونوع المحتوى
+    if not file.filename.lower().endswith(('.xlsx', '.xls')):
+        flash('يجب أن يكون الملف من نوع Excel (.xlsx أو .xls)', 'error')
+        return redirect(url_for('import_citizens'))
+    
+    # التحقق من نوع المحتوى
+    allowed_mimes = [
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',  # .xlsx
+        'application/vnd.ms-excel'  # .xls
+    ]
+    if file.content_type not in allowed_mimes:
+        flash('نوع ملف غير مسموح. يجب أن يكون ملف Excel صحيح', 'error')
+        return redirect(url_for('import_citizens'))
+    
+    assigned_user_id = request.form.get('assigned_user')
+    if not assigned_user_id:
+        flash('يجب اختيار المستخدم الذي ستُنسب إليه البيانات', 'error')
+        return redirect(url_for('import_citizens'))
+    
+    try:
+        # التحقق من وجود المستخدم
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT username FROM users WHERE id = ?", (assigned_user_id,))
+        user = c.fetchone()
+        if not user:
+            flash('المستخدم المحدد غير موجود', 'error')
+            return redirect(url_for('import_citizens'))
+        
+        assigned_username = user[0]
+        
+        # قراءة ملف Excel مع حماية إضافية
+        try:
+            df = pd.read_excel(file, nrows=10000)  # حد أقصى 10000 سطر لحماية الذاكرة
+        except Exception as e:
+            flash(f'خطأ في قراءة ملف Excel: ملف تالف أو غير صحيح', 'error')
+            conn.close()
+            return redirect(url_for('import_citizens'))
+        
+        # التحقق من وجود الأعمدة المطلوبة
+        required_columns = ['الاسم الثلاثي', 'الرقم الوطني', 'الجوال', 'الحالة', 'أفراد الأسرة', 'العنوان']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            flash(f'الأعمدة التالية مفقودة في ملف Excel: {", ".join(missing_columns)}', 'error')
+            return redirect(url_for('import_citizens'))
+        
+        # تنظيف البيانات وإضافتها
+        success_count = 0
+        error_count = 0
+        error_details = []
+        
+        for index, row in df.iterrows():
+            try:
+                # تنظيف البيانات
+                full_name = str(row['الاسم الثلاثي']).strip()
+                national_id = str(row['الرقم الوطني']).strip()
+                phone = str(row['الجوال']).strip()
+                status = str(row['الحالة']).strip()
+                family_members = int(float(row['أفراد الأسرة']))
+                address = str(row['العنوان']).strip()
+                notes = str(row.get('الملاحظات', '')).strip() if pd.notna(row.get('الملاحظات')) else ''
+                
+                # تنسيق تلقائي للأرقام
+                # إذا كان رقم الجوال 9 أرقام، أضف 0 في البداية ليصبح 10 أرقام
+                if len(phone) == 9 and phone.isdigit():
+                    phone = '0' + phone
+                
+                # إذا كان الرقم الوطني 10 أرقام، أضف 0 في البداية ليصبح 11 رقم
+                if len(national_id) == 10 and national_id.isdigit():
+                    national_id = '0' + national_id
+                
+                # التحقق من صحة البيانات
+                if len(national_id) != 11 or not national_id.isdigit():
+                    error_details.append(f'السطر {index + 2}: الرقم الوطني غير صحيح ({national_id})')
+                    error_count += 1
+                    continue
+                
+                if len(phone) != 10 or not phone.startswith('09') or not phone.isdigit():
+                    error_details.append(f'السطر {index + 2}: رقم الجوال غير صحيح ({phone})')
+                    error_count += 1
+                    continue
+                
+                # التحقق من عدم وجود الرقم الوطني مسبقاً
+                c.execute("SELECT id FROM citizens WHERE national_id = ?", (national_id,))
+                if c.fetchone():
+                    error_details.append(f'السطر {index + 2}: الرقم الوطني موجود مسبقاً ({national_id})')
+                    error_count += 1
+                    continue
+                
+                # إضافة البيانات
+                c.execute("""
+                    INSERT INTO citizens (full_name, national_id, phone, status, family_members, address, notes, added_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (full_name, national_id, phone, status, family_members, address, notes, assigned_username))
+                
+                success_count += 1
+                
+            except Exception as e:
+                error_details.append(f'السطر {index + 2}: خطأ في المعالجة - {str(e)}')
+                error_count += 1
+        
+        conn.commit()
+        conn.close()
+        
+        # عرض النتائج
+        if success_count > 0:
+            flash(f'تم استيراد {success_count} سجل بنجاح', 'success')
+        
+        if error_count > 0:
+            flash(f'فشل في استيراد {error_count} سجل', 'warning')
+            # عرض أول 5 أخطاء فقط لتجنب ازدحام الرسائل
+            for error in error_details[:5]:
+                flash(error, 'error')
+            if len(error_details) > 5:
+                flash(f'و {len(error_details) - 5} أخطاء أخرى...', 'error')
+        
+    except Exception as e:
+        flash(f'خطأ في قراءة ملف Excel: {str(e)}', 'error')
+        conn.close()
+    
+    return redirect(url_for('import_citizens'))
+
+@app.route('/download_excel_template')
+@require_permission('import_citizens_excel')
+def download_excel_template():
+    """تحميل نموذج Excel لاستيراد بيانات المواطنين"""
+    # إنشاء نموذج Excel
+    data = {
+        'الاسم الثلاثي': ['أحمد محمد علي', 'فاطمة أحمد محمد'],
+        'الرقم الوطني': ['12345678901', '12345678902'],
+        'الجوال': ['0912345678', '0987654321'],
+        'الحالة': ['ارملة', 'حالة صعبة'],
+        'أفراد الأسرة': [5, 3],
+        'العنوان': ['غزة - الشجاعية', 'خان يونس - المواصي'],
+        'الملاحظات': ['بحاجة لمساعدة عاجلة', 'حالة خاصة']
+    }
+    
+    df = pd.DataFrame(data)
+    
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='نموذج البيانات', index=False)
+        
+        # تنسيق الملف
+        worksheet = writer.sheets['نموذج البيانات']
+        from openpyxl.styles import Font, PatternFill, Alignment
+        
+        # تنسيق العناوين
+        header_font = Font(bold=True, color='FFFFFF')
+        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        
+        for cell in worksheet[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center')
+        
+        # تعديل عرض الأعمدة
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 30)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+    
+    output.seek(0)
+    
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name='نموذج_استيراد_المواطنين.xlsx',
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     )
 
 if __name__ == '__main__':
